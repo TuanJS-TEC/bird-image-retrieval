@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyc
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Large binary/data files
+*.faiss
+*.db
+*.log
+
+# Dataset folders (large)
+CUB_200_2011/
+dataset_processed/
+
+# IDE/Editor
+.cursor/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

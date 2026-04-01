@@ -1,0 +1,8 @@
+pillow==12.1.1
+numpy
+pandas
+tqdm
+matplotlib
+torch
+torchvision
+faiss-cpu
