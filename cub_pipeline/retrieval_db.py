@@ -33,9 +33,9 @@ def build_metadata_sqlite_and_faiss(
     faiss = _load_faiss()
     metadata_path = os.path.join(output_dir, "metadata.csv")
     cub_attr_path = os.path.join(output_dir, "features", "tier1_cub312_binary.csv")
-    emb_path = os.path.join(output_dir, "features", "tier2_resnet50_embeddings.npy")
-    emb_index_path = os.path.join(output_dir, "features", "tier2_resnet50_index.csv")
-    vectors_dir = os.path.join(output_dir, "features", "resnet50_vectors")
+    emb_path = os.path.join(output_dir, "features", "tier2_algorithmic_embeddings.npy")
+    emb_index_path = os.path.join(output_dir, "features", "tier2_algorithmic_index.csv")
+    vectors_dir = os.path.join(output_dir, "features", "algorithmic_vectors")
     os.makedirs(vectors_dir, exist_ok=True)
 
     if not os.path.exists(metadata_path):
@@ -43,7 +43,23 @@ def build_metadata_sqlite_and_faiss(
     if not os.path.exists(cub_attr_path):
         raise FileNotFoundError(f"Khong tim thay file attributes: {cub_attr_path}")
     if not os.path.exists(emb_path) or not os.path.exists(emb_index_path):
-        raise FileNotFoundError("Khong tim thay tier2 embeddings. Hay chay pipeline feature truoc.")
+        # Backward compatibility with old artifact names.
+        legacy_eff_path = os.path.join(output_dir, "features", "tier2_efficientnetv2_embeddings.npy")
+        legacy_eff_index = os.path.join(output_dir, "features", "tier2_efficientnetv2_index.csv")
+        legacy_emb_path = os.path.join(output_dir, "features", "tier2_resnet50_embeddings.npy")
+        legacy_emb_index_path = os.path.join(output_dir, "features", "tier2_resnet50_index.csv")
+        if os.path.exists(legacy_eff_path) and os.path.exists(legacy_eff_index):
+            emb_path = legacy_eff_path
+            emb_index_path = legacy_eff_index
+            vectors_dir = os.path.join(output_dir, "features", "efficientnetv2_vectors")
+            os.makedirs(vectors_dir, exist_ok=True)
+        elif os.path.exists(legacy_emb_path) and os.path.exists(legacy_emb_index_path):
+            emb_path = legacy_emb_path
+            emb_index_path = legacy_emb_index_path
+            vectors_dir = os.path.join(output_dir, "features", "resnet50_vectors")
+            os.makedirs(vectors_dir, exist_ok=True)
+        else:
+            raise FileNotFoundError("Khong tim thay tier2 embeddings (Algorithmic/EfficientNetV2-S/ResNet50). Hay chay pipeline feature truoc.")
 
     metadata_df = pd.read_csv(metadata_path)
     cub_attr_df = pd.read_csv(cub_attr_path)

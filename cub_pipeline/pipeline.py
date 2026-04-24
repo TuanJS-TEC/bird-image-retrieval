@@ -67,6 +67,7 @@ Huong dan:
             output_dir=OUTPUT_DIR,
             certainty_threshold=CUB_ATTR_CERTAINTY_THRESHOLD,
             require_torch_for_cnn=REQUIRE_TORCH_FOR_CNN,
+            cub_root=CUB_ROOT,
         )
         if BUILD_METADATA_DB:
             print("\n" + "=" * 60)

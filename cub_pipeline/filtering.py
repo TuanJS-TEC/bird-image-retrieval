@@ -93,10 +93,13 @@ def compute_perching_score(
         tail_points = {int(r["img_id"]): (float(r["x"]), float(r["y"])) for _, r in tails.iterrows()}
         left_leg_points = {int(r["img_id"]): (float(r["x"]), float(r["y"])) for _, r in legs[legs["part_id"] == 8].iterrows()}
         right_leg_points = {int(r["img_id"]): (float(r["x"]), float(r["y"])) for _, r in legs[legs["part_id"] == 12].iterrows()}
+        left_wing_points = {int(r["img_id"]): (float(r["x"]), float(r["y"])) for _, r in wings[wings["part_id"] == 9].iterrows()}
+        right_wing_points = {int(r["img_id"]): (float(r["x"]), float(r["y"])) for _, r in wings[wings["part_id"] == 13].iterrows()}
 
         dx_norm_values = []
         dy_norm_values = []
         leg_y_norm_values = []
+        wing_span_norm_values = []
         for _, rr in out.iterrows():
             img_id = int(rr["img_id"])
             if img_id in beak_points and img_id in tail_points and float(rr["width"]) > 0 and float(rr["height"]) > 0:
@@ -116,9 +119,16 @@ def compute_perching_score(
                 leg_y_norm_values.append(float(max(leg_y_candidates)) if leg_y_candidates else -1.0)
             else:
                 leg_y_norm_values.append(-1.0)
+            if img_id in left_wing_points and img_id in right_wing_points and float(rr["width"]) > 0:
+                wx_l = left_wing_points[img_id][0]
+                wx_r = right_wing_points[img_id][0]
+                wing_span_norm_values.append(float(abs(wx_r - wx_l) / float(rr["width"])))
+            else:
+                wing_span_norm_values.append(-1.0)
         out["beak_tail_dx_norm"] = dx_norm_values
         out["beak_tail_dy_norm"] = dy_norm_values
         out["leg_y_norm_max"] = leg_y_norm_values
+        out["wing_span_norm"] = wing_span_norm_values
 
         if has_attr_signal:
             one_eye_visible = out["left_eye_visible"] ^ out["right_eye_visible"]
@@ -130,7 +140,7 @@ def compute_perching_score(
                 & out["tail_visible"]
                 & (out["bbox_ratio"] <= 1.7)
                 & (out["beak_tail_dx_norm"] >= 0.55)
-                & (out["beak_tail_dy_norm"] >= 0.20)
+                & (out["beak_tail_dy_norm"] >= 0.26)
                 & (out["beak_tail_dy_norm"] <= 0.45)
                 & (out["leg_y_norm_max"] >= 0.62)
             )
