@@ -6,3 +6,6 @@ matplotlib
 torch
 torchvision
 faiss-cpu
+scipy
+scikit-learn
+scikit-image

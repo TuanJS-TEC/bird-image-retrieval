@@ -4,17 +4,22 @@ import os
 import numpy as np
 import pandas as pd
 
-from cub_pipeline.features import extract_resnet50_embeddings
+from cub_pipeline.features import extract_efficientnetv2_embeddings
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Khoi tao va chay ResNet50 embedding tren dataset da xu ly.")
+    parser = argparse.ArgumentParser(description="Khoi tao va chay Tier-2 algorithmic embedding tren dataset da xu ly.")
     parser.add_argument("--output-dir", default="./dataset_processed", help="Thu muc output cua pipeline.")
     parser.add_argument("--limit", type=int, default=0, help="So anh toi da de chay test nhanh (0 = tat ca).")
     parser.add_argument(
         "--allow-missing-torch",
         action="store_true",
-        help="Cho phep bo qua neu thieu torch/torchvision thay vi dung chuong trinh.",
+        help="Tham so cu de tuong thich (khong can torch trong pipeline algorithmic).",
+    )
+    parser.add_argument(
+        "--cub-root",
+        default="./CUB_200_2011/CUB_200_2011",
+        help="Thu muc CUB goc (can de fit anatomy priors cho AG-SFP).",
     )
     return parser.parse_args()
 
@@ -37,14 +42,15 @@ def main() -> None:
         metadata_df = metadata_df.head(args.limit).copy()
 
     print(f"[INFO] So anh dua vao embedding: {len(metadata_df)}")
-    cnn_matrix, cnn_img_ids, cnn_filenames = extract_resnet50_embeddings(
+    cnn_matrix, cnn_img_ids, cnn_filenames, _ = extract_efficientnetv2_embeddings(
         metadata_df=metadata_df,
         images_dir=images_dir,
         require_torch=not args.allow_missing_torch,
+        cub_root=args.cub_root,
     )
 
-    embedding_path = os.path.join(features_dir, "tier2_resnet50_embeddings.npy")
-    index_path = os.path.join(features_dir, "tier2_resnet50_index.csv")
+    embedding_path = os.path.join(features_dir, "tier2_algorithmic_embeddings.npy")
+    index_path = os.path.join(features_dir, "tier2_algorithmic_index.csv")
     np.save(embedding_path, cnn_matrix)
     pd.DataFrame({"img_id": cnn_img_ids, "filename": cnn_filenames}).to_csv(index_path, index=False, encoding="utf-8")
 

@@ -34,10 +34,14 @@ def process_and_save_dataset(
     filtered_df = master_df[master_df["likely_perching"]].copy().reset_index(drop=True)
     print(f"  So anh sau loc tu the: {len(filtered_df)}")
 
+    filtered_classes = int(filtered_df["class_id"].nunique()) if len(filtered_df) else 0
+    avg_per_class = float(len(filtered_df) / max(filtered_classes, 1))
+
     if len(filtered_df) < min_images:
         print(f"  [!] Canh bao: {len(filtered_df)} anh < yeu cau {min_images}.")
+        print(f"      -> Coverage classes={filtered_classes}, avg/class={avg_per_class:.2f}")
         if allow_relax_fallback:
-            print("      -> Noi long threshold de dat du so luong...")
+            print("      -> Tu dong noi long threshold de tang do phu retrieval...")
             filtered_df = master_df.nsmallest(max(min_images, 8000), "bbox_ratio").copy().reset_index(drop=True)
             print(f"      -> Da chon {len(filtered_df)} anh")
         else:
