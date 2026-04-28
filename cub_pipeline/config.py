@@ -48,3 +48,10 @@ RETRIEVAL_EXCLUDED_TIER1_ATTRS = (
 )
 # Apply PCA to Tier-2 before fusion (None or <=0 means disabled).
 TIER2_PCA_DIM = 448
+
+# ── Feature Fitting Pool ─────────────────────────────────────────────────────
+# When True, Tier-2 model fitting (PCA, GMM, KMeans, anatomy priors) uses the
+# full set of original CUB images for all 126 filtered species (~7 486 images)
+# instead of only the 511 filtered/perching images.
+# The 511 filtered images are still the only ones encoded into FAISS + SQLite.
+USE_FULL_SPECIES_FOR_FIT = True

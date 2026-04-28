@@ -192,15 +192,19 @@ def _moments_lab_12(region_rgb: np.ndarray) -> np.ndarray:
     feats: list[float] = []
     for i in range(3):
         c = lab[:, :, i].reshape(-1)
-        feats.extend(
-            [
-                float(np.mean(c)),
-                float(np.std(c)),
-                float(stats.skew(c, bias=False, nan_policy="omit")),
-                float(stats.kurtosis(c, fisher=True, bias=False, nan_policy="omit")),
-            ]
-        )
+        mean_val = float(np.mean(c))
+        std_val = float(np.std(c))
+        if std_val < 1e-6:
+            # Nearly uniform region — skew and kurtosis are undefined/meaningless.
+            # Return 0.0 directly to avoid scipy RuntimeWarning about precision loss.
+            skew_val = 0.0
+            kurt_val = 0.0
+        else:
+            skew_val = float(stats.skew(c, bias=False, nan_policy="omit"))
+            kurt_val = float(stats.kurtosis(c, fisher=True, bias=False, nan_policy="omit"))
+        feats.extend([mean_val, std_val, skew_val, kurt_val])
     return np.nan_to_num(np.array(feats, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
 
 
 def _fit_anatomy_regions(metadata_df: pd.DataFrame, cub_root: str) -> dict[str, list[int]]:
@@ -416,18 +420,59 @@ def fit_algorithmic_tier2(
     images_dir: str,
     cub_root: str,
     features_dir: str,
+    fit_metadata_df: pd.DataFrame | None = None,
+    fit_images_dir: str | None = None,
 ) -> AlgorithmicArtifacts:
+    """Fit Tier-2 algorithmic artifacts and encode retrieval vectors.
+
+    Args:
+        metadata_df: DataFrame of the 511 filtered images used for retrieval.
+        images_dir: Directory containing the 511 processed/filtered images.
+        cub_root: CUB_200_2011 root path (needed for anatomy part_locs).
+        features_dir: Output directory for saved artifacts.
+        fit_metadata_df: Optional larger pool DataFrame (e.g. 7 486 images from
+            the original CUB dataset for the 126 filtered species).  When
+            provided, unsupervised fitting (PCA, GMM, KMeans, anatomy priors)
+            uses this pool instead of the 511 filtered images.
+        fit_images_dir: Directory of images for fit_metadata_df.  Must be set
+            when fit_metadata_df is provided.
+    """
     os.makedirs(features_dir, exist_ok=True)
     prof = _tier2_speed_profile()
     fast_mode = os.environ.get("ALGO_TIER2_FAST_MODE", "1") == "1"
-    img_rows = metadata_df[["img_id", "filename"]].copy()
-    paths = [os.path.join(images_dir, fn) for fn in img_rows["filename"].tolist() if os.path.exists(os.path.join(images_dir, fn))]
+
+    # ── Decide which image pool to use for fitting ───────────────────────────
+    use_extended_fit = fit_metadata_df is not None and fit_images_dir is not None
+    if use_extended_fit:
+        fit_img_rows = fit_metadata_df[["img_id", "filepath"]].copy()
+        fit_paths = [
+            os.path.join(fit_images_dir, fp)
+            for fp in fit_img_rows["filepath"].tolist()
+            if os.path.exists(os.path.join(fit_images_dir, fp))
+        ]
+        print(f"  [INFO] Fit pool: EXTENDED ({len(fit_paths)} anh goc cua 126 loai)")
+    else:
+        img_rows = metadata_df[["img_id", "filename"]].copy()
+        fit_paths = [
+            os.path.join(images_dir, fn)
+            for fn in img_rows["filename"].tolist()
+            if os.path.exists(os.path.join(images_dir, fn))
+        ]
+        print(f"  [INFO] Fit pool: FILTERED only ({len(fit_paths)} anh sau loc)")
+
+    # For anatomy priors, always use metadata_df (511 filtered) which has bbox
+    # coords aligned to the cropped/resized images already saved to images_dir.
+    # The extended pool uses raw CUB images, whose bboxes differ, so anatomy
+    # fitting still leverages metadata_df for coordinate-based region mapping.
+    anatomy_meta = metadata_df
+
     sampled_limit = 240 if fast_mode else 600
-    sampled_paths = paths[: min(sampled_limit, len(paths))]
+    sampled_paths = fit_paths[: min(sampled_limit, len(fit_paths))]
     sampled_imgs = [_read_rgb(p) for p in sampled_paths]
     print(f"  [INFO] Tier2 fit mode={'FAST' if fast_mode else 'FULL'} | sampled_images={len(sampled_imgs)}")
 
-    anatomy_regions = _fit_anatomy_regions(metadata_df, cub_root)
+    anatomy_regions = _fit_anatomy_regions(anatomy_meta, cub_root)
+
 
     color_bank = np.stack([_hsv_hist_256(img) for img in sampled_imgs], axis=0) if sampled_imgs else np.zeros((1, 256), dtype=np.float32)
     color_var = color_bank.var(axis=0)
@@ -464,6 +509,15 @@ def fit_algorithmic_tier2(
         hfve_pca=dummy,
         final_pca=dummy,
     )
+
+    # ── Encoding paths: always the 511 filtered images ────────────────────────
+    retrieval_img_rows = metadata_df[["img_id", "filename"]].copy()
+    encode_paths = [
+        os.path.join(images_dir, fn)
+        for fn in retrieval_img_rows["filename"].tolist()
+        if os.path.exists(os.path.join(images_dir, fn))
+    ]
+    print(f"  [INFO] Encode pool: {len(encode_paths)} anh (511 anh da loc cho FAISS/SQLite)")
 
     all_px = []
     for img in tqdm(sampled_imgs, desc="    ACV collect foreground", leave=False):
@@ -502,11 +556,10 @@ def fit_algorithmic_tier2(
     artifacts.hfve_gmm = gmm
 
     agsfp_vectors, acv_vectors, hfve_vectors, ppd_vectors = [], [], [], []
-    acv_df = np.zeros((len(paths), 256), dtype=np.float32)
     acv_df_count = np.zeros(256, dtype=np.float32)
     anatomy_bank = []
     img_ids = []
-    for path in tqdm(paths, desc="    Encode Tier2 algorithmic", leave=False):
+    for path in tqdm(encode_paths, desc="    Encode Tier2 algorithmic", leave=False):
         img = _read_rgb(path)
         ag_raw, anatomy_blocks = _agsfp_2760(img, artifacts)
         agsfp_vectors.append(ag_raw)
@@ -535,7 +588,7 @@ def fit_algorithmic_tier2(
         hfve_vectors.append(_fisher_encode(desc, artifacts.hfve_gmm))
         ppd_vectors.append(_ppd_152(img))
 
-    n_img = max(1, len(paths))
+    n_img = max(1, len(encode_paths))
     idf = np.log((n_img + 1.0) / (acv_df_count + 1.0)).astype(np.float32)
     artifacts.acv_idf = idf
     acv_weighted = [(_l2_normalize(v.reshape(5, 256) * idf.reshape(1, 256)).reshape(-1)) for v in acv_vectors]

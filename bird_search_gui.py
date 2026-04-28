@@ -1,7 +1,9 @@
 import argparse
+import json
 import os
 import sqlite3
 import tkinter as tk
+import time
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
@@ -9,6 +11,8 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 from cub_pipeline.algorithmic_tier2 import extract_algorithmic_embedding, load_algorithmic_artifacts
+from cub_pipeline.tier1_features import extract_similarity_tier1_vector
+from cub_pipeline.tier3_features import extract_hog_shape, extract_hsv_histogram_48, extract_lbp_texture_64
 
 try:
     from cub_pipeline.config import RERANK_FUSION_WEIGHTS
@@ -21,6 +25,29 @@ except Exception:
     AQE_ALPHA = 0.60
     DIFFUSION_ALPHA = 0.25
     PART_WEIGHTS = (0.35, 0.30, 0.15, 0.10, 0.10)
+
+
+DEBUG_LOG_PATH = "/Users/minhtuansfile/HoangTuan_Code/CSDL_DPT/.cursor/debug-9afddb.log"
+DEBUG_SESSION_ID = "9afddb"
+
+
+def _agent_debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict[str, Any]) -> None:
+    # #region agent log
+    payload = {
+        "sessionId": DEBUG_SESSION_ID,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "message": message,
+        "data": data,
+        "timestamp": int(time.time() * 1000),
+    }
+    try:
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
 
 def _load_faiss():
@@ -80,6 +107,7 @@ class BirdImageSearchApp:
         self._np_vectors: np.ndarray | None = None
         self._np_meta: list[dict[str, Any]] = []
         self._sim_graph: np.ndarray | None = None
+        self.dataset_stats = self._get_dataset_stats()
         self._init_numpy_backend()
         self._build_similarity_graph()
 
@@ -98,103 +126,71 @@ class BirdImageSearchApp:
             return (0.10, 0.80, 0.10)
         return (w1 / total, w2 / total, w3 / total)
 
+    def _get_dataset_stats(self) -> dict[str, Any]:
+        try:
+            row = self.conn.execute(
+                """
+                SELECT
+                    COUNT(*) AS total_rows,
+                    COUNT(DISTINCT species_id) AS total_species
+                FROM images
+                """
+            ).fetchone()
+            minmax = self.conn.execute(
+                """
+                SELECT MIN(c) AS min_per_species, MAX(c) AS max_per_species
+                FROM (
+                    SELECT species_id, COUNT(*) AS c
+                    FROM images
+                    GROUP BY species_id
+                )
+                """
+            ).fetchone()
+            stats = {
+                "total_rows": int(row["total_rows"]) if row else 0,
+                "total_species": int(row["total_species"]) if row else 0,
+                "min_per_species": int(minmax["min_per_species"]) if minmax and minmax["min_per_species"] is not None else 0,
+                "max_per_species": int(minmax["max_per_species"]) if minmax and minmax["max_per_species"] is not None else 0,
+            }
+            _agent_debug_log(
+                run_id="post-fix",
+                hypothesis_id="H8",
+                location="bird_search_gui.py:_get_dataset_stats",
+                message="Indexed dataset coverage",
+                data=stats,
+            )
+            return stats
+        except Exception:
+            return {"total_rows": 0, "total_species": 0, "min_per_species": 0, "max_per_species": 0}
+
+    def _find_species_rank(self, items: list[dict[str, Any]], keyword: str = "groove_billed_ani") -> dict[str, Any]:
+        key = str(keyword).lower()
+        for idx, item in enumerate(items, start=1):
+            species = str(item.get("species_name", "")).lower()
+            if key in species:
+                return {
+                    "found": True,
+                    "rank": int(idx),
+                    "species_name": str(item.get("species_name", "")),
+                    "filename": str(item.get("filename", "")),
+                    "similarity": float(item.get("similarity", 0.0)) if "similarity" in item else None,
+                    "fused_similarity": float(item.get("fused_similarity", 0.0)) if "fused_similarity" in item else None,
+                }
+        return {"found": False, "rank": None}
+
     def _extract_tier1_vector(self, img: Image.Image) -> np.ndarray:
-        arr = np.array(img.convert("HSV"), dtype=np.float32)
-        h = arr[:, :, 0] / 255.0
-        s = arr[:, :, 1] / 255.0
-        v = arr[:, :, 2] / 255.0
-        valid = (s > 0.20) & (v > 0.15)
-        color_red = float((((h < 0.05) | (h >= 0.95)) & valid).mean())
-        color_yellow = float((((h >= 0.12) & (h < 0.20)) & valid).mean())
-        color_blue = float((((h >= 0.55) & (h < 0.75)) & valid).mean())
-
-        gray = np.array(img.convert("L"), dtype=np.float32) / 255.0
-        gx = np.zeros_like(gray, dtype=np.float32)
-        gy = np.zeros_like(gray, dtype=np.float32)
-        gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
-        gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
-        grad = np.sqrt(gx**2 + gy**2)
-        edge_thr = float(np.quantile(grad, 0.80))
-        edge_density = float((grad > edge_thr).mean())
-        texture_entropy = float(-(np.histogram((gray * 255).astype(np.uint8), bins=32, range=(0, 256))[0] / (gray.size + 1e-8) * np.log2(np.histogram((gray * 255).astype(np.uint8), bins=32, range=(0, 256))[0] / (gray.size + 1e-8) + 1e-12)).sum())
-        fg_mask = valid | (v < 0.20)
-        ys, xs = np.where(fg_mask)
-        fg_area_ratio = float(fg_mask.mean())
-        if len(xs) > 0 and len(ys) > 0:
-            x0, x1 = int(xs.min()), int(xs.max())
-            y0, y1 = int(ys.min()), int(ys.max())
-            fg_aspect_ratio = float(max(1, x1 - x0 + 1) / max(1, y1 - y0 + 1))
-        else:
-            fg_aspect_ratio = 1.0
-        left = gray[:, : gray.shape[1] // 2]
-        right = np.fliplr(gray[:, gray.shape[1] - left.shape[1] :])
-        symmetry_lr = float(1.0 - np.mean(np.abs(left - right)))
-        grad_x_energy = float(np.mean(np.abs(gx)))
-        grad_y_energy = float(np.mean(np.abs(gy)))
-        grad_anisotropy = float(abs(grad_x_energy - grad_y_energy) / (grad_x_energy + grad_y_energy + 1e-8))
-
-        # Same subset as training similarity cols in cub_pipeline/features.py
-        vec = np.array(
-            [
-                color_red,
-                color_yellow,
-                color_blue,
-                float(s.mean()),
-                texture_entropy,
-                fg_area_ratio,
-                fg_aspect_ratio,
-                symmetry_lr,
-                grad_anisotropy,
-                0.0,  # hu1 placeholder (not available in quick query path)
-                0.0,  # hu2 placeholder (not available in quick query path)
-            ],
-            dtype=np.float32,
-        )
-        return vec
+        return extract_similarity_tier1_vector(img)
 
     def _extract_tier3_vector(self, img: Image.Image) -> np.ndarray:
         rgb = img.convert("RGB")
-        hsv = np.array(rgb.convert("HSV"))
-        hsv_parts = []
-        for idx in range(3):
-            hist, _ = np.histogram(hsv[:, :, idx], bins=16, range=(0, 256))
-            hsv_parts.append(hist.astype(np.float32))
-        hsv_feat = np.concatenate(hsv_parts, axis=0)
-        hsv_feat = hsv_feat / (float(hsv_feat.sum()) + 1e-8)
-
-        gray_u8 = np.array(rgb.convert("L"), dtype=np.uint8)
-        shifts = [(-1, -1), (-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (1, -1), (0, -1)]
-        lbp = np.zeros_like(gray_u8, dtype=np.uint8)
-        for bit_idx, (dy, dx) in enumerate(shifts):
-            shifted = np.roll(gray_u8, shift=(dy, dx), axis=(0, 1))
-            lbp |= ((shifted >= gray_u8).astype(np.uint8) << bit_idx)
-        lbp_hist, _ = np.histogram(lbp, bins=64, range=(0, 256))
-        lbp_feat = lbp_hist.astype(np.float32)
-        lbp_feat = lbp_feat / (float(lbp_feat.sum()) + 1e-8)
-
-        gray = np.array(rgb.convert("L"), dtype=np.float32) / 255.0
-        gx = np.zeros_like(gray, dtype=np.float32)
-        gy = np.zeros_like(gray, dtype=np.float32)
-        gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
-        gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
-        magnitude = np.sqrt(gx**2 + gy**2)
-        orientation = np.degrees(np.arctan2(gy, gx)) % 180.0
-        h, w = gray.shape
-        cell_h = max(h // 4, 1)
-        cell_w = max(w // 4, 1)
-        hog_desc = []
-        for r in range(4):
-            for c in range(4):
-                y0, y1 = r * cell_h, min((r + 1) * cell_h, h)
-                x0, x1 = c * cell_w, min((c + 1) * cell_w, w)
-                cm = magnitude[y0:y1, x0:x1].reshape(-1)
-                co = orientation[y0:y1, x0:x1].reshape(-1)
-                hist, _ = np.histogram(co, bins=9, range=(0, 180), weights=cm)
-                hog_desc.append(hist.astype(np.float32))
-        hog_feat = np.concatenate(hog_desc, axis=0)
-        hog_feat = hog_feat / (np.linalg.norm(hog_feat) + 1e-8)
-
-        return np.concatenate([hsv_feat, lbp_feat, hog_feat], axis=0).astype(np.float32)
+        return np.concatenate(
+            [
+                extract_hsv_histogram_48(rgb),
+                extract_lbp_texture_64(rgb),
+                extract_hog_shape(rgb),
+            ],
+            axis=0,
+        ).astype(np.float32)
 
     def _cos_sim(self, a: np.ndarray, b: np.ndarray) -> float:
         return float(np.dot(a, b) / ((np.linalg.norm(a) + 1e-8) * (np.linalg.norm(b) + 1e-8)))
@@ -208,7 +204,14 @@ class BirdImageSearchApp:
             return [0.5 for _ in values]
         return [(v - lo) / (hi - lo) for v in values]
 
-    def _rerank_multi_tier(self, query_img: Image.Image, query_cnn: np.ndarray, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _rerank_multi_tier(
+        self,
+        query_img: Image.Image,
+        query_cnn: np.ndarray,
+        items: list[dict[str, Any]],
+        weights_override: tuple[float, float, float] | None = None,
+        run_id: str = "pre-fix",
+    ) -> list[dict[str, Any]]:
         query_tier1 = self._extract_tier1_vector(query_img)
         query_tier3 = self._extract_tier3_vector(query_img.resize((224, 224), Image.Resampling.BILINEAR))
         out: list[dict[str, Any]] = []
@@ -241,7 +244,10 @@ class BirdImageSearchApp:
         t3_norm = self._minmax_norm(t3_vals)
 
         # Tier-2 algorithmic vector la tin hieu retrieval chinh.
-        w1, w2, w3 = self.rerank_weights
+        if weights_override is not None:
+            w1, w2, w3 = (float(weights_override[0]), float(weights_override[1]), float(weights_override[2]))
+        else:
+            w1, w2, w3 = self.rerank_weights
         for idx, payload in enumerate(out):
             payload["sim_tier1_norm"] = float(t1_norm[idx])
             payload["sim_tier2_norm"] = float(t2_norm[idx])
@@ -251,6 +257,44 @@ class BirdImageSearchApp:
             )
 
         out.sort(key=lambda x: x["fused_similarity"], reverse=True)
+        groove_diag = {"found": False, "rank": None}
+        for idx, payload in enumerate(out, start=1):
+            if "groove_billed_ani" in str(payload.get("species_name", "")).lower():
+                groove_diag = {
+                    "found": True,
+                    "rank": int(idx),
+                    "species_name": str(payload.get("species_name", "")),
+                    "filename": str(payload.get("filename", "")),
+                    "tier1_raw": float(payload.get("sim_tier1", 0.0)),
+                    "tier2_raw": float(payload.get("sim_tier2", 0.0)),
+                    "tier3_raw": float(payload.get("sim_tier3", 0.0)),
+                    "tier1_norm": float(payload.get("sim_tier1_norm", 0.0)),
+                    "tier2_norm": float(payload.get("sim_tier2_norm", 0.0)),
+                    "tier3_norm": float(payload.get("sim_tier3_norm", 0.0)),
+                    "fused": float(payload.get("fused_similarity", 0.0)),
+                }
+                break
+        _agent_debug_log(
+            run_id=run_id,
+            hypothesis_id="H4",
+            location="bird_search_gui.py:_rerank_multi_tier",
+            message="Tier fusion diagnostics",
+            data={
+                "candidate_count": len(out),
+                "weights": {"tier1": float(w1), "tier2": float(w2), "tier3": float(w3)},
+                "tier2_norm_span": [float(min(t2_norm)) if t2_norm else 0.0, float(max(t2_norm)) if t2_norm else 0.0],
+                "top3_after_fusion": [
+                    {
+                        "filename": str(x.get("filename", "")),
+                        "species": str(x.get("species_name", "")),
+                        "fused": float(x.get("fused_similarity", 0.0)),
+                        "tier2_raw": float(x.get("sim_tier2", 0.0)),
+                    }
+                    for x in out[:3]
+                ],
+                "groove_diag": groove_diag,
+            },
+        )
         return out[: self.top_k]
 
     def _confidence_flags(self, path: str, tier2_candidates: list[dict[str, Any]]) -> dict[str, Any]:
@@ -307,6 +351,16 @@ class BirdImageSearchApp:
         ttk.Label(top, text=f"DB: {self.sqlite_path}").grid(row=3, column=0, columnspan=4, sticky="w")
         ttk.Label(top, text=f"FAISS: {self.faiss_path}").grid(row=4, column=0, columnspan=4, sticky="w")
         ttk.Label(top, text=f"Image folder: {self.images_dir}").grid(row=5, column=0, columnspan=4, sticky="w")
+        if self.dataset_stats.get("total_species", 0) < 180:
+            ttk.Label(
+                top,
+                text=(
+                    f"Coverage canh bao: species={self.dataset_stats.get('total_species', 0)} "
+                    f"| rows={self.dataset_stats.get('total_rows', 0)} "
+                    f"| min/species={self.dataset_stats.get('min_per_species', 0)}. "
+                    "Nen build lai dataset retrieval voi do phu cao hon."
+                ),
+            ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(2, 0))
         top.columnconfigure(1, weight=1)
 
         startup_status = "San sang. Chon 1 anh chim de bat dau."
@@ -538,7 +592,22 @@ class BirdImageSearchApp:
             return query_feat
         mean_top = np.mean(np.stack(vecs, axis=0), axis=0).astype(np.float32)
         expanded = AQE_ALPHA * query_feat + (1.0 - AQE_ALPHA) * mean_top
-        return expanded / (np.linalg.norm(expanded) + 1e-8)
+        expanded = expanded / (np.linalg.norm(expanded) + 1e-8)
+        _agent_debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H2",
+            location="bird_search_gui.py:_apply_query_expansion",
+            message="AQE query drift check",
+            data={
+                "first_pass_size": len(first_pass),
+                "alpha": float(AQE_ALPHA),
+                "query_norm_before": float(np.linalg.norm(query_feat)),
+                "mean_top_norm": float(np.linalg.norm(mean_top)),
+                "expanded_norm": float(np.linalg.norm(expanded)),
+                "cos_query_to_expanded": float(np.dot(query_feat, expanded) / ((np.linalg.norm(query_feat) + 1e-8) * (np.linalg.norm(expanded) + 1e-8))),
+            },
+        )
+        return expanded
 
     def _apply_diffusion(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if self._sim_graph is None or self._np_meta is None:
@@ -565,6 +634,24 @@ class BirdImageSearchApp:
             merged["similarity"] = (1.0 - DIFFUSION_ALPHA) * raw + DIFFUSION_ALPHA * float(propagated[pos])
             out.append(merged)
         out.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+        _agent_debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H2",
+            location="bird_search_gui.py:_apply_diffusion",
+            message="Diffusion rank shift check",
+            data={
+                "input_size": len(items),
+                "diffusion_alpha": float(DIFFUSION_ALPHA),
+                "top3_after_diffusion": [
+                    {
+                        "filename": str(x.get("filename", "")),
+                        "species": str(x.get("species_name", "")),
+                        "similarity": float(x.get("similarity", 0.0)),
+                    }
+                    for x in out[:3]
+                ],
+            },
+        )
         return out
 
     def _part_based_adjust(self, query_path: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -585,8 +672,30 @@ class BirdImageSearchApp:
             merged = dict(item)
             base = float(merged.get("similarity", 0.0)) if self.use_cosine else -float(merged.get("distance", 0.0))
             merged["similarity"] = 0.70 * base + 0.30 * sim_part
+            merged["sim_part"] = float(sim_part)
+            merged["sim_base_before_part"] = float(base)
             out.append(merged)
         out.sort(key=lambda x: float(x.get("similarity", 0.0)), reverse=True)
+        _agent_debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H3",
+            location="bird_search_gui.py:_part_based_adjust",
+            message="Part-based adjustment impact",
+            data={
+                "input_size": len(items),
+                "weights": [float(v) for v in weights.tolist()],
+                "top3_after_part_adjust": [
+                    {
+                        "filename": str(x.get("filename", "")),
+                        "species": str(x.get("species_name", "")),
+                        "base": float(x.get("sim_base_before_part", 0.0)),
+                        "sim_part": float(x.get("sim_part", 0.0)),
+                        "final_similarity": float(x.get("similarity", 0.0)),
+                    }
+                    for x in out[:3]
+                ],
+            },
+        )
         return out
 
     def _render_results(self, items: list[dict[str, Any]]) -> None:
@@ -612,15 +721,17 @@ class BirdImageSearchApp:
             ttk.Label(card, text=f"species: {item['species_name']}", wraplength=180).pack(anchor="w")
             ttk.Label(card, text=f"file: {item['filename']}", wraplength=180).pack(anchor="w")
 
-    def _search_top_k(self, query_feat: np.ndarray) -> list[dict[str, Any]]:
+    def _search_top_k(self, query_feat: np.ndarray, top_k_override: int | None = None) -> list[dict[str, Any]]:
+        request_k = int(top_k_override) if top_k_override is not None else int(self.top_k)
+        request_k = max(1, request_k)
         if self.index is None:
-            return self._search_top_k_numpy(query_feat)
+            return self._search_top_k_numpy(query_feat, top_k_override=request_k)
         if self.faiss is None:
             raise RuntimeError("FAISS backend khong kha dung.")
         query = query_feat.reshape(1, -1).astype(np.float32)
         if self.use_cosine:
             self.faiss.normalize_L2(query)
-        distances, indices = self.index.search(query, self.top_k)
+        distances, indices = self.index.search(query, request_k)
 
         items: list[dict[str, Any]] = []
         for score_or_dist, faiss_idx in zip(distances[0], indices[0]):
@@ -640,23 +751,47 @@ class BirdImageSearchApp:
             items.sort(key=lambda x: x["similarity"], reverse=True)
         else:
             items.sort(key=lambda x: x["distance"])
+        _agent_debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H1",
+            location="bird_search_gui.py:_search_top_k",
+            message="First-stage retrieval stats",
+            data={
+                "backend": "faiss",
+                "use_cosine": bool(self.use_cosine),
+                "query_dim": int(query_feat.shape[0]),
+                "query_norm": float(np.linalg.norm(query_feat)),
+                "request_k": int(request_k),
+                "top3": [
+                    {
+                        "filename": str(x.get("filename", "")),
+                        "species": str(x.get("species_name", "")),
+                        "similarity": float(x.get("similarity", 0.0)) if self.use_cosine else None,
+                        "distance": float(x.get("distance", 0.0)) if not self.use_cosine else None,
+                    }
+                    for x in items[:3]
+                ],
+            },
+        )
         return items
 
-    def _search_top_k_numpy(self, query_feat: np.ndarray) -> list[dict[str, Any]]:
+    def _search_top_k_numpy(self, query_feat: np.ndarray, top_k_override: int | None = None) -> list[dict[str, Any]]:
         if self._np_vectors is None or not self._np_meta:
             raise RuntimeError("NumPy backend chua duoc khoi tao.")
+        request_k = int(top_k_override) if top_k_override is not None else int(self.top_k)
+        request_k = max(1, request_k)
 
         query = query_feat.astype(np.float32)
         if self.use_cosine:
             query = query / (np.linalg.norm(query) + 1e-8)
             scores = self._np_vectors @ query
-            k = min(self.top_k, scores.shape[0])
+            k = min(request_k, scores.shape[0])
             top_idx = np.argpartition(-scores, k - 1)[:k]
             sorted_idx = top_idx[np.argsort(-scores[top_idx])]
             return [dict(self._np_meta[i], similarity=float(scores[i])) for i in sorted_idx]
 
         dists = np.sum((self._np_vectors - query.reshape(1, -1)) ** 2, axis=1)
-        k = min(self.top_k, dists.shape[0])
+        k = min(request_k, dists.shape[0])
         top_idx = np.argpartition(dists, k - 1)[:k]
         sorted_idx = top_idx[np.argsort(dists[top_idx])]
         return [dict(self._np_meta[i], distance=float(dists[i])) for i in sorted_idx]
@@ -677,6 +812,18 @@ class BirdImageSearchApp:
             self._init_numpy_backend()
         self.status_var.set("Dang trich xuat dac trung va tim kiem...")
         self.root.update_idletasks()
+        _agent_debug_log(
+            run_id="pre-fix",
+            hypothesis_id="H5",
+            location="bird_search_gui.py:search",
+            message="Search started",
+            data={
+                "query_path": os.path.abspath(path),
+                "metric": "cosine" if self.use_cosine else "l2",
+                "is_external_query": os.path.abspath(path).replace("\\", "/").find("/dataset_processed/images/") < 0,
+                "configured_top_k": int(self.top_k),
+            },
+        )
 
         try:
             src_img = Image.open(path).convert("RGB")
@@ -686,6 +833,17 @@ class BirdImageSearchApp:
             self._set_flow_image("tier1", tier1_img, tier1_desc)
 
             query_feat = self.embedder.embed_image(path)
+            _agent_debug_log(
+                run_id="pre-fix",
+                hypothesis_id="H1",
+                location="bird_search_gui.py:search",
+                message="Query embedding extracted",
+                data={
+                    "query_dim": int(query_feat.shape[0]),
+                    "query_norm": float(np.linalg.norm(query_feat)),
+                    "query_head8": [float(v) for v in query_feat[:8].tolist()],
+                },
+            )
             tier2_img, tier2_desc = self._tier2_visual(src_img, query_feat)
             self._set_flow_image("tier2", tier2_img, tier2_desc)
 
@@ -693,18 +851,62 @@ class BirdImageSearchApp:
             self._set_flow_image("tier3", tier3_img, tier3_desc)
 
             # 1) First-pass retrieval from algorithmic 512D index.
-            old_top_k = self.top_k
-            self.top_k = max(self.top_k, 20)
-            first_pass = self._search_top_k(query_feat)
-            # 2) AQE query expansion.
-            expanded_query = self._apply_query_expansion(query_feat, first_pass)
-            tier2_candidates = self._search_top_k(expanded_query)
-            # 3) Graph diffusion.
-            tier2_candidates = self._apply_diffusion(tier2_candidates)
-            # 4) Part-based asymmetric adjustment (head/body/tail/wing/leg priors).
-            tier2_candidates = self._part_based_adjust(path, tier2_candidates)
-            self.top_k = old_top_k
-            results = self._rerank_multi_tier(src_img, query_feat, tier2_candidates)
+            first_pass_k = max(self.top_k, 20)
+            first_pass = self._search_top_k(query_feat, top_k_override=first_pass_k)
+            pre_flags = self._confidence_flags(path, first_pass)
+
+            # External low-confidence queries are prone to PRF drift.
+            # Use larger direct pool + multi-tier rerank instead of AQE/diffusion/part-adjust.
+            if pre_flags["out_of_scope_risk"]:
+                robust_k = max(self.top_k * 20, 120)
+                tier2_candidates = self._search_top_k(query_feat, top_k_override=robust_k)
+                groove_rank_pool = self._find_species_rank(tier2_candidates)
+                # External query + low-confidence first pass:
+                # keep retrieval signal mostly from Tier-2 (indexed algorithmic embedding)
+                # because Tier-1/Tier-3 quick query features are only approximate.
+                rerank_weights_override = (0.0, 1.0, 0.0)
+                _agent_debug_log(
+                    run_id="post-fix",
+                    hypothesis_id="H6",
+                    location="bird_search_gui.py:search",
+                    message="External low-confidence robust mode enabled",
+                    data={
+                        "first_pass_k": int(first_pass_k),
+                        "robust_k": int(robust_k),
+                        "top1_first_pass": float(pre_flags["top1_score"]),
+                        "margin_first_pass": float(pre_flags["margin"]),
+                        "rerank_weights_override": [float(x) for x in rerank_weights_override],
+                        "groove_rank_in_tier2_pool": groove_rank_pool,
+                    },
+                )
+            else:
+                # 2) AQE query expansion.
+                expanded_query = self._apply_query_expansion(query_feat, first_pass)
+                tier2_candidates = self._search_top_k(expanded_query, top_k_override=first_pass_k)
+                # 3) Graph diffusion.
+                tier2_candidates = self._apply_diffusion(tier2_candidates)
+                # 4) Part-based asymmetric adjustment (head/body/tail/wing/leg priors).
+                tier2_candidates = self._part_based_adjust(path, tier2_candidates)
+                rerank_weights_override = None
+            results = self._rerank_multi_tier(
+                src_img,
+                query_feat,
+                tier2_candidates,
+                weights_override=rerank_weights_override,
+                run_id="post-fix" if pre_flags["out_of_scope_risk"] else "pre-fix",
+            )
+            groove_rank_final = self._find_species_rank(results)
+            _agent_debug_log(
+                run_id="post-fix",
+                hypothesis_id="H7",
+                location="bird_search_gui.py:search",
+                message="Final result target-species rank",
+                data={
+                    "result_size": len(results),
+                    "groove_rank_in_final": groove_rank_final,
+                    "top5_species": [str(x.get("species_name", "")) for x in results[:5]],
+                },
+            )
             flags = self._confidence_flags(path, tier2_candidates)
             self._show_query_image(path)
             self._render_results(results)

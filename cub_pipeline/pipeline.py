@@ -13,10 +13,11 @@ from .config import (
     REQUIRE_TORCH_FOR_CNN,
     SQLITE_DB_PATH,
     TARGET_SIZE,
+    USE_FULL_SPECIES_FOR_FIT,
 )
 from .features import build_recognition_feature_package
 from .filtering import compute_perching_score, find_perching_attribute_ids, visualize_bbox_distribution
-from .metadata import load_all_metadata
+from .metadata import load_all_metadata, load_full_species_for_fit
 from .processing import process_and_save_dataset
 from .retrieval_db import build_metadata_sqlite_and_faiss
 from .reports import generate_dataset_report, print_final_summary, verify_output_sample
@@ -31,11 +32,11 @@ def main() -> None:
         print(f"[LOI] Khong tim thay thu muc dataset: {CUB_ROOT}")
         print(
             """
-Huong dan:
-  1. Tai CUB_200_2011 va giai nen
-  2. Dat thu muc CUB_200_2011/ canh file script nay
-  3. Chay lai script
-"""
+                Huong dan:
+                1. Tai CUB_200_2011 va giai nen
+                2. Dat thu muc CUB_200_2011/ canh file script nay
+                3. Chay lai script
+            """
         )
         return
 
@@ -56,8 +57,21 @@ Huong dan:
         OUTPUT_DIR,
         target_size=TARGET_SIZE,
         min_images=MIN_IMAGES,
+        part_locs_df=part_locs,
         allow_relax_fallback=ALLOW_RELAX_FALLBACK,
     )
+
+    # ── Feature fitting pool ─────────────────────────────────────────────────
+    # Load all original CUB images belonging to the 126 filtered species.
+    # These are used to fit unsupervised models (PCA, GMM, KMeans, anatomy
+    # priors) so they generalise better across the species.
+    # The 511 filtered images remain the only ones stored in FAISS + SQLite.
+    fit_metadata_df = None
+    fit_images_dir = None
+    if USE_FULL_SPECIES_FOR_FIT:
+        filtered_class_ids = set(metadata_df["class_id"].unique())
+        fit_metadata_df = load_full_species_for_fit(CUB_ROOT, filtered_class_ids)
+        fit_images_dir = os.path.join(CUB_ROOT, "images")
 
     if EXTRACT_RECOGNITION_FEATURES:
         build_recognition_feature_package(
@@ -68,6 +82,8 @@ Huong dan:
             certainty_threshold=CUB_ATTR_CERTAINTY_THRESHOLD,
             require_torch_for_cnn=REQUIRE_TORCH_FOR_CNN,
             cub_root=CUB_ROOT,
+            fit_metadata_df=fit_metadata_df,
+            fit_images_dir=fit_images_dir,
         )
         if BUILD_METADATA_DB:
             print("\n" + "=" * 60)
@@ -87,3 +103,4 @@ Huong dan:
     generate_dataset_report(metadata_df, OUTPUT_DIR)
     verify_output_sample(metadata_df, OUTPUT_DIR)
     print_final_summary(metadata_df, OUTPUT_DIR)
+
