@@ -1,0 +1,4 @@
+-r requirements.base.txt
+
+# Linux CUDA acceleration
+cupy-cuda12x

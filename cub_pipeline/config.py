@@ -23,6 +23,12 @@ DIFFUSION_ALPHA = 0.25
 # (head, breast, back_wing, tail, leg)
 PART_WEIGHTS = (0.35, 0.30, 0.15, 0.10, 0.10)
 
+# Adaptive score-level fusion in GUI rerank
+ADAPTIVE_FUSION_ENABLED = True
+ADAPTIVE_CONFIDENCE_THRESHOLD = 0.80
+ADAPTIVE_PROTOTYPE_MIN_SCORE = 0.70
+ADAPTIVE_PROTOTYPE_MARGIN = 0.02
+
 # Tier-wise feature fusion for recognition_features_all.npz
 # Apply per-tier z-score normalization before weighted concatenation.
 ENABLE_TIER_NORMALIZATION = True

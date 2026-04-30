@@ -23,6 +23,7 @@ dataset_processed/
 
 # IDE/Editor
 .cursor/
+.claude/
 .vscode/
 *.swp
 *.swo

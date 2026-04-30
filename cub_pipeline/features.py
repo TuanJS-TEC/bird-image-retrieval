@@ -32,6 +32,10 @@ from .tier3_features import (
     extract_hsv_histogram_48 as _tier3_extract_hsv_histogram_48,
     extract_lbp_texture_64 as _tier3_extract_lbp_texture_64,
 )
+from .gpu_backend import load_cuml, load_cupy
+
+_CP = load_cupy()
+_CUML = load_cuml()
 
 
 def _zscore_per_column(matrix: np.ndarray) -> np.ndarray:
@@ -78,15 +82,35 @@ def _apply_tier2_pca(
             fit_matrix.astype(np.float32, copy=False) if fit_matrix is not None else None,
             {"enabled": 0.0, "input_dim": float(d), "output_dim": float(d), "explained_variance_ratio": 1.0},
         )
-    pca = PCA(n_components=n_comp, random_state=42)
-    pca.fit(train.astype(np.float32))
-    transformed = pca.transform(matrix.astype(np.float32)).astype(np.float32)
-    transformed_fit = pca.transform(train.astype(np.float32)).astype(np.float32)
+    transformed: np.ndarray
+    transformed_fit: np.ndarray
+    explained_ratio = 1.0
+    if _CUML is not None and _CP is not None:
+        try:
+            pca_gpu = _CUML.PCA(n_components=n_comp, random_state=42)
+            pca_gpu.fit(_CP.asarray(train.astype(np.float32)))
+            transformed = _CP.asnumpy(pca_gpu.transform(_CP.asarray(matrix.astype(np.float32)))).astype(np.float32)
+            transformed_fit = _CP.asnumpy(pca_gpu.transform(_CP.asarray(train.astype(np.float32)))).astype(np.float32)
+            if hasattr(pca_gpu, "explained_variance_ratio_"):
+                explained_ratio = float(_CP.asnumpy(pca_gpu.explained_variance_ratio_).sum())
+        except Exception as ex:
+            print(f"  [WARN] cuML PCA loi, fallback sklearn: {ex}")
+            pca = PCA(n_components=n_comp, random_state=42)
+            pca.fit(train.astype(np.float32))
+            transformed = pca.transform(matrix.astype(np.float32)).astype(np.float32)
+            transformed_fit = pca.transform(train.astype(np.float32)).astype(np.float32)
+            explained_ratio = float(np.sum(pca.explained_variance_ratio_))
+    else:
+        pca = PCA(n_components=n_comp, random_state=42)
+        pca.fit(train.astype(np.float32))
+        transformed = pca.transform(matrix.astype(np.float32)).astype(np.float32)
+        transformed_fit = pca.transform(train.astype(np.float32)).astype(np.float32)
+        explained_ratio = float(np.sum(pca.explained_variance_ratio_))
     meta = {
         "enabled": 1.0,
         "input_dim": float(d),
         "output_dim": float(n_comp),
-        "explained_variance_ratio": float(np.sum(pca.explained_variance_ratio_)),
+        "explained_variance_ratio": explained_ratio,
     }
     return transformed, transformed_fit, meta
 
@@ -339,6 +363,46 @@ def write_requirement2_report(
         f.write("\n".join(lines))
 
 
+def write_tier2_class_prototypes(
+    features_dir: str,
+    metadata_df: pd.DataFrame,
+    tier2_matrix: np.ndarray,
+) -> None:
+    if tier2_matrix.size == 0 or len(metadata_df) == 0:
+        return
+    ordered = metadata_df.reset_index(drop=True).copy()
+    if tier2_matrix.shape[0] != len(ordered):
+        return
+    work = ordered[["class_id", "class_name"]].copy()
+    work["class_id"] = work["class_id"].astype(int)
+    work["row_idx"] = np.arange(len(work), dtype=np.int32)
+
+    class_ids: list[int] = []
+    class_names: list[str] = []
+    class_counts: list[int] = []
+    prototypes: list[np.ndarray] = []
+    for class_id, group in work.groupby("class_id", sort=True):
+        idx = group["row_idx"].to_numpy(dtype=np.int32)
+        if idx.size == 0:
+            continue
+        proto = tier2_matrix[idx].mean(axis=0).astype(np.float32)
+        norm = float(np.linalg.norm(proto) + 1e-8)
+        proto = (proto / norm).astype(np.float32)
+        class_ids.append(int(class_id))
+        class_names.append(str(group["class_name"].iloc[0]))
+        class_counts.append(int(idx.size))
+        prototypes.append(proto)
+    if not prototypes:
+        return
+    np.savez_compressed(
+        os.path.join(features_dir, "tier2_class_prototypes.npz"),
+        class_ids=np.array(class_ids, dtype=np.int32),
+        class_names=np.array(class_names),
+        class_counts=np.array(class_counts, dtype=np.int32),
+        prototypes=np.stack(prototypes, axis=0).astype(np.float32),
+    )
+
+
 def build_recognition_feature_package(
     metadata_df: pd.DataFrame,
     attr_labels_df: pd.DataFrame,
@@ -558,6 +622,11 @@ def build_recognition_feature_package(
         algorithmic_tier2_weighted=tier2_weighted,
         handcrafted_weighted=tier3_weighted,
         all_features=final_matrix,
+    )
+    write_tier2_class_prototypes(
+        features_dir=features_dir,
+        metadata_df=metadata_df,
+        tier2_matrix=cnn_aligned,
     )
     manifest = {
         "total_images": int(len(metadata_df)),

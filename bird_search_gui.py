@@ -11,8 +11,11 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 from cub_pipeline.algorithmic_tier2 import extract_algorithmic_embedding, load_algorithmic_artifacts
+from cub_pipeline.gpu_backend import configure_cuda_library_path, faiss_gpu_available
 from cub_pipeline.tier1_features import extract_similarity_tier1_vector
 from cub_pipeline.tier3_features import extract_hog_shape, extract_hsv_histogram_48, extract_lbp_texture_64
+
+configure_cuda_library_path()
 
 try:
     from cub_pipeline.config import RERANK_FUSION_WEIGHTS
@@ -25,6 +28,19 @@ except Exception:
     AQE_ALPHA = 0.60
     DIFFUSION_ALPHA = 0.25
     PART_WEIGHTS = (0.35, 0.30, 0.15, 0.10, 0.10)
+
+try:
+    from cub_pipeline.config import (
+        ADAPTIVE_CONFIDENCE_THRESHOLD,
+        ADAPTIVE_FUSION_ENABLED,
+        ADAPTIVE_PROTOTYPE_MARGIN,
+        ADAPTIVE_PROTOTYPE_MIN_SCORE,
+    )
+except Exception:
+    ADAPTIVE_FUSION_ENABLED = True
+    ADAPTIVE_CONFIDENCE_THRESHOLD = 0.80
+    ADAPTIVE_PROTOTYPE_MIN_SCORE = 0.70
+    ADAPTIVE_PROTOTYPE_MARGIN = 0.02
 
 
 DEBUG_LOG_PATH = "/Users/minhtuansfile/HoangTuan_Code/CSDL_DPT/.cursor/debug-9afddb.log"
@@ -102,11 +118,17 @@ class BirdImageSearchApp:
 
         self.embedder = QueryEmbedder(self.features_dir)
         self.faiss = _load_faiss()
+        self.faiss_device = "cpu"
         self.conn = self._open_sqlite()
         self.index = self._load_index() if self.faiss is not None else None
         self._np_vectors: np.ndarray | None = None
         self._np_meta: list[dict[str, Any]] = []
         self._sim_graph: np.ndarray | None = None
+        self._class_proto_scores: dict[int, float] = {}
+        self._class_proto_top_id: int | None = None
+        self._class_proto_top_score: float = 0.0
+        self._class_proto_margin: float = 0.0
+        self._class_prototypes = self._load_class_prototypes()
         self.dataset_stats = self._get_dataset_stats()
         self._init_numpy_backend()
         self._build_similarity_graph()
@@ -211,6 +233,7 @@ class BirdImageSearchApp:
         items: list[dict[str, Any]],
         weights_override: tuple[float, float, float] | None = None,
         run_id: str = "pre-fix",
+        confidence_flags: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         query_tier1 = self._extract_tier1_vector(query_img)
         query_tier3 = self._extract_tier3_vector(query_img.resize((224, 224), Image.Resampling.BILINEAR))
@@ -248,13 +271,34 @@ class BirdImageSearchApp:
             w1, w2, w3 = (float(weights_override[0]), float(weights_override[1]), float(weights_override[2]))
         else:
             w1, w2, w3 = self.rerank_weights
+        adaptive_payload: list[dict[str, float]] = []
         for idx, payload in enumerate(out):
             payload["sim_tier1_norm"] = float(t1_norm[idx])
             payload["sim_tier2_norm"] = float(t2_norm[idx])
             payload["sim_tier3_norm"] = float(t3_norm[idx])
-            payload["fused_similarity"] = (
-                w1 * payload["sim_tier1_norm"] + w2 * payload["sim_tier2_norm"] + w3 * payload["sim_tier3_norm"]
-            )
+            wi1, wi2, wi3 = w1, w2, w3
+            if ADAPTIVE_FUSION_ENABLED:
+                low_conf = bool((confidence_flags or {}).get("low_confidence", False))
+                top1 = float((confidence_flags or {}).get("top1_score", 0.0))
+                if low_conf or top1 < float(ADAPTIVE_CONFIDENCE_THRESHOLD):
+                    wi1, wi2, wi3 = 0.0, 1.0, 0.0
+                else:
+                    cid = int(payload.get("species_id", -1))
+                    proto_s = float(self._class_proto_scores.get(cid, 0.0))
+                    strong_proto = (
+                        cid == self._class_proto_top_id
+                        and proto_s >= float(ADAPTIVE_PROTOTYPE_MIN_SCORE)
+                        and self._class_proto_margin >= float(ADAPTIVE_PROTOTYPE_MARGIN)
+                    )
+                    if strong_proto:
+                        wi1 = min(0.35, w1 + 0.10)
+                        wi2 = max(0.45, w2 - 0.08)
+                        wi3 = max(0.10, 1.0 - wi1 - wi2)
+            payload["fused_similarity"] = wi1 * payload["sim_tier1_norm"] + wi2 * payload["sim_tier2_norm"] + wi3 * payload["sim_tier3_norm"]
+            payload["w_tier1"] = float(wi1)
+            payload["w_tier2"] = float(wi2)
+            payload["w_tier3"] = float(wi3)
+            adaptive_payload.append({"w1": float(wi1), "w2": float(wi2), "w3": float(wi3)})
 
         out.sort(key=lambda x: x["fused_similarity"], reverse=True)
         groove_diag = {"found": False, "rank": None}
@@ -282,6 +326,12 @@ class BirdImageSearchApp:
             data={
                 "candidate_count": len(out),
                 "weights": {"tier1": float(w1), "tier2": float(w2), "tier3": float(w3)},
+                "prototype_top": {
+                    "class_id": self._class_proto_top_id,
+                    "score": float(self._class_proto_top_score),
+                    "margin": float(self._class_proto_margin),
+                },
+                "adaptive_weight_examples": adaptive_payload[:3],
                 "tier2_norm_span": [float(min(t2_norm)) if t2_norm else 0.0, float(max(t2_norm)) if t2_norm else 0.0],
                 "top3_after_fusion": [
                     {
@@ -313,12 +363,62 @@ class BirdImageSearchApp:
             "out_of_scope_risk": out_of_scope_risk,
         }
 
+    def _load_class_prototypes(self) -> dict[str, Any]:
+        path = os.path.join(self.features_dir, "tier2_class_prototypes.npz")
+        if not os.path.exists(path):
+            return {}
+        try:
+            z = np.load(path, allow_pickle=False)
+            class_ids = z["class_ids"].astype(np.int32)
+            protos = z["prototypes"].astype(np.float32)
+            norms = np.linalg.norm(protos, axis=1, keepdims=True) + 1e-8
+            protos = (protos / norms).astype(np.float32)
+            return {"class_ids": class_ids, "prototypes": protos}
+        except Exception:
+            return {}
+
+    def _compute_prototype_scores(self, query_feat: np.ndarray) -> None:
+        self._class_proto_scores = {}
+        self._class_proto_top_id = None
+        self._class_proto_top_score = 0.0
+        self._class_proto_margin = 0.0
+        if not self._class_prototypes:
+            return
+        class_ids = self._class_prototypes["class_ids"]
+        protos = self._class_prototypes["prototypes"]
+        q = query_feat.astype(np.float32, copy=False)
+        q = q / (np.linalg.norm(q) + 1e-8)
+        scores = protos @ q
+        for i, cid in enumerate(class_ids):
+            self._class_proto_scores[int(cid)] = float(scores[i])
+        order = np.argsort(-scores)
+        if order.size == 0:
+            return
+        top_idx = int(order[0])
+        self._class_proto_top_id = int(class_ids[top_idx])
+        self._class_proto_top_score = float(scores[top_idx])
+        if order.size > 1:
+            self._class_proto_margin = float(scores[top_idx] - scores[int(order[1])])
+
     def _load_index(self):
         if not os.path.exists(self.faiss_path):
             return None
         if self.faiss is None:
             return None
-        return self.faiss.read_index(self.faiss_path)
+        index = self.faiss.read_index(self.faiss_path)
+        if not faiss_gpu_available(self.faiss):
+            self.faiss_device = "cpu"
+            return index
+        try:
+            res = self.faiss.StandardGpuResources()
+            gpu_index = self.faiss.index_cpu_to_gpu(res, 0, index)
+            self._faiss_gpu_res = res
+            self.faiss_device = "gpu"
+            return gpu_index
+        except Exception as ex:
+            self.faiss_device = "cpu"
+            print(f"[WARN] Khong the su dung FAISS GPU trong GUI, fallback CPU: {ex}")
+            return index
 
     def _open_sqlite(self):
         if not os.path.exists(self.sqlite_path):
@@ -346,7 +446,10 @@ class BirdImageSearchApp:
         metric_box.grid(row=1, column=1, sticky="w", pady=(8, 0))
         ttk.Radiobutton(metric_box, text="Cosine", variable=self.metric_var, value="cosine").pack(side=tk.LEFT)
         ttk.Radiobutton(metric_box, text="L2", variable=self.metric_var, value="l2").pack(side=tk.LEFT, padx=10)
-        backend_text = "FAISS" if self.index is not None else "NumPy (fallback, exact search)"
+        if self.index is not None:
+            backend_text = f"FAISS ({self.faiss_device.upper()})"
+        else:
+            backend_text = "NumPy (fallback, exact search)"
         ttk.Label(top, text=f"Backend: {backend_text}").grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(top, text=f"DB: {self.sqlite_path}").grid(row=3, column=0, columnspan=4, sticky="w")
         ttk.Label(top, text=f"FAISS: {self.faiss_path}").grid(row=4, column=0, columnspan=4, sticky="w")
@@ -833,6 +936,7 @@ class BirdImageSearchApp:
             self._set_flow_image("tier1", tier1_img, tier1_desc)
 
             query_feat = self.embedder.embed_image(path)
+            self._compute_prototype_scores(query_feat)
             _agent_debug_log(
                 run_id="pre-fix",
                 hypothesis_id="H1",
@@ -842,6 +946,9 @@ class BirdImageSearchApp:
                     "query_dim": int(query_feat.shape[0]),
                     "query_norm": float(np.linalg.norm(query_feat)),
                     "query_head8": [float(v) for v in query_feat[:8].tolist()],
+                    "prototype_top_class": self._class_proto_top_id,
+                    "prototype_top_score": float(self._class_proto_top_score),
+                    "prototype_margin": float(self._class_proto_margin),
                 },
             )
             tier2_img, tier2_desc = self._tier2_visual(src_img, query_feat)
@@ -894,6 +1001,7 @@ class BirdImageSearchApp:
                 tier2_candidates,
                 weights_override=rerank_weights_override,
                 run_id="post-fix" if pre_flags["out_of_scope_risk"] else "pre-fix",
+                confidence_flags=pre_flags,
             )
             groove_rank_final = self._find_species_rank(results)
             _agent_debug_log(

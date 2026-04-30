@@ -17,6 +17,7 @@ from .config import (
 )
 from .features import build_recognition_feature_package
 from .filtering import compute_perching_score, find_perching_attribute_ids, visualize_bbox_distribution
+from .gpu_backend import configure_cuda_library_path
 from .metadata import load_all_metadata, load_full_species_for_fit
 from .processing import process_and_save_dataset
 from .retrieval_db import build_metadata_sqlite_and_faiss
@@ -24,6 +25,7 @@ from .reports import generate_dataset_report, print_final_summary, verify_output
 
 
 def main() -> None:
+    configure_cuda_library_path()
     print("\n" + "BIRD " * 10)
     print("  CHUAN BI DATASET CUB-200-2011 - YEU CAU 1")
     print("BIRD " * 10 + "\n")
@@ -104,3 +106,6 @@ def main() -> None:
     verify_output_sample(metadata_df, OUTPUT_DIR)
     print_final_summary(metadata_df, OUTPUT_DIR)
 
+
+if __name__ == "__main__":
+    main()
