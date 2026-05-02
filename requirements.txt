@@ -1,11 +1,1 @@
-pillow==12.1.1
-numpy
-pandas
-tqdm
-matplotlib
-torch
-torchvision
-faiss-cpu
-scipy
-scikit-learn
-scikit-image
+-r requirements.base.txt

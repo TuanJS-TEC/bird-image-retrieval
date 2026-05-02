@@ -1,0 +1,5 @@
+-r requirements.base.txt
+
+# macOS Apple Silicon:
+# - keep CPU FAISS from base (faiss-cpu)
+# - do not install CUDA-specific packages

@@ -26,6 +26,7 @@ def process_and_save_dataset(
     output_dir: str,
     target_size: tuple = (224, 224),
     min_images: int = 500,
+    part_locs_df: pd.DataFrame | None = None,
     allow_relax_fallback: bool = False,
 ) -> pd.DataFrame:
     print("\n" + "=" * 60)
@@ -67,8 +68,38 @@ def process_and_save_dataset(
             pass
     _debug_log(run_id="debug", hypothesis_id="H", location="cub_pipeline/processing.py", message="sync_done", data={})
 
+    # Standardize bird heading direction using beak/tail landmarks.
+    # Convention: output image should face RIGHT (beak_x > tail_x).
+    beak_x_map: dict[int, float] = {}
+    tail_x_map: dict[int, float] = {}
+    class_face_right_majority: dict[int, bool] = {}
+    if part_locs_df is not None and len(part_locs_df) > 0:
+        beaks = part_locs_df[(part_locs_df["part_id"] == 2) & (part_locs_df["visible"] == 1)][["img_id", "x"]].copy()
+        tails = part_locs_df[(part_locs_df["part_id"] == 14) & (part_locs_df["visible"] == 1)][["img_id", "x"]].copy()
+        beak_x_map = {int(r["img_id"]): float(r["x"]) for _, r in beaks.iterrows()}
+        tail_x_map = {int(r["img_id"]): float(r["x"]) for _, r in tails.iterrows()}
+
+        orient_rows = []
+        for _, rr in master_df[["img_id", "class_id"]].drop_duplicates().iterrows():
+            img_id = int(rr["img_id"])
+            if img_id in beak_x_map and img_id in tail_x_map:
+                orient_rows.append(
+                    {
+                        "class_id": int(rr["class_id"]),
+                        "face_right": float(beak_x_map[img_id] > tail_x_map[img_id]),
+                    }
+                )
+        if orient_rows:
+            orient_df = pd.DataFrame(orient_rows)
+            class_face_right_majority = (
+                orient_df.groupby("class_id")["face_right"].mean().map(lambda v: bool(v >= 0.5)).to_dict()
+            )
+
     metadata_records = []
     errors = []
+    flipped_count = 0
+    inferred_by_landmark = 0
+    inferred_by_class_majority = 0
     for _, row in tqdm(filtered_df.iterrows(), total=len(filtered_df), desc="  Dang xu ly anh"):
         src_path = os.path.join(cub_root, "images", row["filepath"])
         if not os.path.exists(src_path):
@@ -78,6 +109,20 @@ def process_and_save_dataset(
             img = Image.open(src_path).convert("RGB")
             original_w, original_h = img.size
             processed_img = crop_and_resize(img, (row["x"], row["y"], row["width"], row["height"]), target_size)
+
+            img_id = int(row["img_id"])
+            class_id = int(row["class_id"])
+            should_flip = False
+            if img_id in beak_x_map and img_id in tail_x_map:
+                inferred_by_landmark += 1
+                should_flip = not bool(beak_x_map[img_id] > tail_x_map[img_id])
+            elif class_id in class_face_right_majority:
+                inferred_by_class_majority += 1
+                should_flip = not bool(class_face_right_majority[class_id])
+            if should_flip:
+                processed_img = processed_img.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+                flipped_count += 1
+
             original_filename = os.path.basename(row["filepath"])
             out_filename = f"{int(row['img_id']):05d}_{original_filename}"
             out_path = os.path.join(images_out_dir, out_filename)
@@ -99,6 +144,7 @@ def process_and_save_dataset(
                     "bbox_ratio": round(float(row["bbox_ratio"]), 4),
                     "target_width": target_size[0],
                     "target_height": target_size[1],
+                    "hflip_applied": int(should_flip),
                 }
             )
         except Exception as e:
@@ -113,5 +159,9 @@ def process_and_save_dataset(
     metadata_path = os.path.join(output_dir, "metadata.csv")
     metadata_df.to_csv(metadata_path, index=False, encoding="utf-8")
     print(f"\n  [OK] Da xu ly thanh cong: {len(metadata_df)} anh")
+    print(
+        "  [INFO] Chuan hoa huong nhin: "
+        f"flipped={flipped_count}, by_landmark={inferred_by_landmark}, by_class_majority={inferred_by_class_majority}"
+    )
     print(f"  [OK] Metadata CSV: {metadata_path}")
     return metadata_df

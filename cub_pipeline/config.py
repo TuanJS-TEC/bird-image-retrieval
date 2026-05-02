@@ -1,5 +1,8 @@
 CUB_ROOT = "./CUB_200_2011/CUB_200_2011"
-OUTPUT_DIR = "./dataset_processed"
+OUTPUT_DIR = "./dataset_process"
+# True: full pipeline tai metadata.csv + images/ san co duoi OUTPUT_DIR, bo qua loc/crop/luu lai.
+# Can ghi de tam thoi: export BIRD_REUSE_FILTERED_DATASET=0 de chay lai buoc loc.
+REUSE_EXISTING_FILTERED_DATASET = False # False: chay lai buoc loc
 TARGET_SIZE = (224, 224)
 MIN_IMAGES = 500
 ALLOW_RELAX_FALLBACK = False
@@ -22,6 +25,12 @@ AQE_ALPHA = 0.60
 DIFFUSION_ALPHA = 0.25
 # (head, breast, back_wing, tail, leg)
 PART_WEIGHTS = (0.35, 0.30, 0.15, 0.10, 0.10)
+
+# Adaptive score-level fusion in GUI rerank
+ADAPTIVE_FUSION_ENABLED = True
+ADAPTIVE_CONFIDENCE_THRESHOLD = 0.80
+ADAPTIVE_PROTOTYPE_MIN_SCORE = 0.70
+ADAPTIVE_PROTOTYPE_MARGIN = 0.02
 
 # Tier-wise feature fusion for recognition_features_all.npz
 # Apply per-tier z-score normalization before weighted concatenation.
@@ -48,3 +57,13 @@ RETRIEVAL_EXCLUDED_TIER1_ATTRS = (
 )
 # Apply PCA to Tier-2 before fusion (None or <=0 means disabled).
 TIER2_PCA_DIM = 448
+
+# ── Feature Fitting Pool ─────────────────────────────────────────────────────
+# When True, Tier-2 model fitting (PCA, GMM, KMeans, anatomy priors) uses the
+# full set of original CUB images for all 126 filtered species (~7 486 images)
+# instead of only the 511 filtered/perching images.
+# The 511 filtered images are still the only ones encoded into FAISS + SQLite.
+USE_FULL_SPECIES_FOR_FIT = True
+# Gioi han so anh goc trong extended pool CHI cho thong ke z-score (Tang1/Tang3 + encode Tier2 fit).
+# 0 = dung toan bo (~7k anh, rat cham). >0: lay mau stratified theo class_id (giu can bang loai).
+EXTENDED_FIT_STATS_MAX_IMAGES = 2800

@@ -6,6 +6,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .gpu_backend import faiss_gpu_available
+
 
 def _load_faiss():
     try:
@@ -22,6 +24,18 @@ def _normalize_if_needed(matrix: np.ndarray, use_cosine: bool, faiss_module: Any
     if use_cosine:
         faiss_module.normalize_L2(vectors)
     return vectors
+
+
+def _to_faiss_gpu_index_if_possible(index: Any, faiss_module: Any) -> tuple[Any, Any | None]:
+    if not faiss_gpu_available(faiss_module):
+        return index, None
+    try:
+        res = faiss_module.StandardGpuResources()
+        gpu_index = faiss_module.index_cpu_to_gpu(res, 0, index)
+        return gpu_index, res
+    except Exception as ex:
+        print(f"[WARN] Khong the chuyen FAISS sang GPU, fallback CPU: {ex}")
+        return index, None
 
 
 def build_metadata_sqlite_and_faiss(
@@ -129,9 +143,12 @@ def build_metadata_sqlite_and_faiss(
 
     vectors = _normalize_if_needed(emb_matrix, use_cosine=use_cosine, faiss_module=faiss)
     dim = vectors.shape[1]
-    index = faiss.IndexFlatIP(dim) if use_cosine else faiss.IndexFlatL2(dim)
-    index.add(vectors)
-    faiss.write_index(index, faiss_path)
+    index_cpu = faiss.IndexFlatIP(dim) if use_cosine else faiss.IndexFlatL2(dim)
+    index_runtime, _ = _to_faiss_gpu_index_if_possible(index_cpu, faiss)
+    index_runtime.add(vectors)
+    if index_runtime is not index_cpu and hasattr(faiss, "index_gpu_to_cpu"):
+        index_cpu = faiss.index_gpu_to_cpu(index_runtime)
+    faiss.write_index(index_cpu, faiss_path)
 
     metric = "cosine(IndexFlatIP + normalize_L2)" if use_cosine else "L2(IndexFlatL2)"
     return {
@@ -155,7 +172,8 @@ def search_similar_vectors(
     if query_feat.ndim != 1:
         raise ValueError("query_feat phai la vector 1 chieu.")
 
-    index = faiss.read_index(faiss_path)
+    index_cpu = faiss.read_index(faiss_path)
+    index, _ = _to_faiss_gpu_index_if_possible(index_cpu, faiss)
     query = query_feat.reshape(1, -1).astype(np.float32)
     if use_cosine:
         faiss.normalize_L2(query)

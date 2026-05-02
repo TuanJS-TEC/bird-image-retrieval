@@ -17,10 +17,100 @@ from skimage.feature import local_binary_pattern
 from skimage.filters import threshold_otsu
 from tqdm import tqdm
 
+from .gpu_backend import load_cuml, load_cupy
+
+_CP = load_cupy()
+_CUML = load_cuml()
+
+
+def _to_cpu_array(arr: Any) -> np.ndarray:
+    if _CP is not None and isinstance(arr, _CP.ndarray):
+        return _CP.asnumpy(arr)
+    return np.asarray(arr)
+
+
+def _fit_kmeans(data: np.ndarray, n_clusters: int, max_iter: int, random_state: int, batch_size: int = 8000, n_init: int = 3) -> tuple[Any, np.ndarray]:
+    x = data.astype(np.float32, copy=False)
+    if _CUML is not None and _CP is not None:
+        try:
+            model = _CUML.KMeans(
+                n_clusters=n_clusters,
+                max_iter=max_iter,
+                n_init=n_init,
+                random_state=random_state,
+            )
+            labels_gpu = model.fit_predict(_CP.asarray(x))
+            return model, _CP.asnumpy(labels_gpu).astype(np.int32, copy=False)
+        except Exception as ex:
+            print(f"  [WARN] cuML KMeans loi, fallback sklearn: {ex}")
+    model = MiniBatchKMeans(
+        n_clusters=n_clusters,
+        batch_size=batch_size,
+        n_init=n_init if n_init > 1 else "auto",
+        max_iter=max_iter,
+        random_state=random_state,
+    )
+    labels = model.fit_predict(x)
+    return model, labels.astype(np.int32, copy=False)
+
+
+def _cluster_centers(model: Any) -> np.ndarray:
+    return _to_cpu_array(model.cluster_centers_).astype(np.float32, copy=False)
+
+
+def _fit_pca(mat: np.ndarray, max_dim: int) -> Any:
+    n_comp = int(min(max_dim, mat.shape[0], mat.shape[1]))
+    n_comp = max(1, n_comp)
+    x = mat.astype(np.float32, copy=False)
+    if _CUML is not None and _CP is not None:
+        try:
+            pca = _CUML.PCA(n_components=n_comp, random_state=42)
+            pca.fit(_CP.asarray(x))
+            return pca
+        except Exception as ex:
+            print(f"  [WARN] cuML PCA loi, fallback sklearn: {ex}")
+    pca = PCA(n_components=n_comp, random_state=42)
+    pca.fit(x)
+    return pca
+
+
+def _pca_transform(pca_model: Any, mat: np.ndarray) -> np.ndarray:
+    out = pca_model.transform(mat.astype(np.float32, copy=False))
+    return _to_cpu_array(out).astype(np.float32, copy=False)
+
+
+def _fit_gmm(desc_train: np.ndarray, n_components: int, fast_mode: bool) -> Any:
+    x = desc_train.astype(np.float32, copy=False)
+    if _CUML is not None and _CP is not None:
+        try:
+            gmm = _CUML.GaussianMixture(
+                n_components=n_components,
+                covariance_type="diag",
+                max_iter=60 if fast_mode else 100,
+                random_state=42,
+            )
+            gmm.fit(_CP.asarray(x))
+            return gmm
+        except Exception as ex:
+            print(f"  [WARN] cuML GMM loi, fallback sklearn: {ex}")
+    gmm = GaussianMixture(
+        n_components=n_components,
+        covariance_type="diag",
+        max_iter=60 if fast_mode else 100,
+        n_init=2,
+        random_state=42,
+    )
+    gmm.fit(x)
+    return gmm
+
 
 def _l2_normalize(vec: np.ndarray) -> np.ndarray:
     vec = vec.astype(np.float32, copy=False)
-    return vec / (np.linalg.norm(vec) + 1e-8)
+    if _CP is None:
+        return vec / (np.linalg.norm(vec) + 1e-8)
+    gpu_vec = _CP.asarray(vec, dtype=_CP.float32)
+    out = gpu_vec / (_CP.linalg.norm(gpu_vec) + 1e-8)
+    return _CP.asnumpy(out).astype(np.float32, copy=False)
 
 
 def _clip_box(x0: int, y0: int, x1: int, y1: int, width: int = 224, height: int = 224) -> tuple[int, int, int, int]:
@@ -59,7 +149,8 @@ def _tier2_speed_profile() -> dict[str, int]:
     Tier2 speed/quality trade-off profile controlled by ALGO_TIER2_SPEED_LEVEL.
     Supported levels: quality | balanced | fast.
     """
-    level = os.environ.get("ALGO_TIER2_SPEED_LEVEL", "balanced").strip().lower()
+    # Default to highest-quality profile unless user overrides by env var.
+    level = os.environ.get("ALGO_TIER2_SPEED_LEVEL", "quality").strip().lower()
     if level == "quality":
         return {
             "level": 2,
@@ -119,15 +210,15 @@ def _dominant_color_24(region_rgb: np.ndarray) -> np.ndarray:
         pixels_rgb = _subsample_rows(pixels_rgb, int(prof["dominant_color_sample"]))
         if len(pixels_rgb) < 3:
             pixels_rgb = np.repeat(pixels_rgb, 3, axis=0)
-        km = MiniBatchKMeans(
+        km, labels = _fit_kmeans(
+            pixels_rgb,
             n_clusters=3,
             batch_size=2048,
-            n_init="auto",
+            n_init=1,
             max_iter=int(prof["dominant_color_max_iter"]),
             random_state=42,
         )
-        labels = km.fit_predict(pixels_rgb)
-        centers_rgb = np.clip(km.cluster_centers_, 0.0, 255.0).astype(np.uint8)
+        centers_rgb = np.clip(_cluster_centers(km), 0.0, 255.0).astype(np.uint8)
         counts = np.bincount(labels, minlength=3).astype(np.float32)
         ratios = counts / (float(counts.sum()) + 1e-8)
     else:
@@ -175,13 +266,24 @@ def _lbp_hist_256(gray: np.ndarray, radius: int, points: int) -> np.ndarray:
 
 
 def _oriented_gradient_36(gray: np.ndarray) -> np.ndarray:
-    gray = gray.astype(np.float32) / 255.0
-    gx = np.zeros_like(gray, dtype=np.float32)
-    gy = np.zeros_like(gray, dtype=np.float32)
-    gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
-    gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
-    mag = np.sqrt(gx**2 + gy**2)
-    ori = (np.degrees(np.arctan2(gy, gx)) + 360.0) % 360.0
+    if _CP is None:
+        gray = gray.astype(np.float32) / 255.0
+        gx = np.zeros_like(gray, dtype=np.float32)
+        gy = np.zeros_like(gray, dtype=np.float32)
+        gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
+        gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
+        mag = np.sqrt(gx**2 + gy**2)
+        ori = (np.degrees(np.arctan2(gy, gx)) + 360.0) % 360.0
+    else:
+        gray_gpu = _CP.asarray(gray.astype(np.float32) / 255.0)
+        gx = _CP.zeros_like(gray_gpu, dtype=_CP.float32)
+        gy = _CP.zeros_like(gray_gpu, dtype=_CP.float32)
+        gx[:, 1:-1] = gray_gpu[:, 2:] - gray_gpu[:, :-2]
+        gy[1:-1, :] = gray_gpu[2:, :] - gray_gpu[:-2, :]
+        mag = _CP.sqrt(gx**2 + gy**2)
+        ori = (_CP.degrees(_CP.arctan2(gy, gx)) + 360.0) % 360.0
+        mag = _CP.asnumpy(mag)
+        ori = _CP.asnumpy(ori)
     hist, _ = np.histogram(ori.reshape(-1), bins=36, range=(0, 360), weights=mag.reshape(-1))
     hist = hist.astype(np.float32)
     return hist / (float(hist.sum()) + 1e-8)
@@ -192,15 +294,19 @@ def _moments_lab_12(region_rgb: np.ndarray) -> np.ndarray:
     feats: list[float] = []
     for i in range(3):
         c = lab[:, :, i].reshape(-1)
-        feats.extend(
-            [
-                float(np.mean(c)),
-                float(np.std(c)),
-                float(stats.skew(c, bias=False, nan_policy="omit")),
-                float(stats.kurtosis(c, fisher=True, bias=False, nan_policy="omit")),
-            ]
-        )
+        mean_val = float(np.mean(c))
+        std_val = float(np.std(c))
+        if std_val < 1e-6:
+            # Nearly uniform region — skew and kurtosis are undefined/meaningless.
+            # Return 0.0 directly to avoid scipy RuntimeWarning about precision loss.
+            skew_val = 0.0
+            kurt_val = 0.0
+        else:
+            skew_val = float(stats.skew(c, bias=False, nan_policy="omit"))
+            kurt_val = float(stats.kurtosis(c, fisher=True, bias=False, nan_policy="omit"))
+        feats.extend([mean_val, std_val, skew_val, kurt_val])
     return np.nan_to_num(np.array(feats, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
 
 
 def _fit_anatomy_regions(metadata_df: pd.DataFrame, cub_root: str) -> dict[str, list[int]]:
@@ -244,12 +350,31 @@ def _fit_anatomy_regions(metadata_df: pd.DataFrame, cub_root: str) -> dict[str, 
 
 
 def _fg_mask(region_rgb: np.ndarray) -> np.ndarray:
-    hsv = np.array(Image.fromarray(region_rgb).convert("HSV"), dtype=np.uint8)
-    sat = hsv[:, :, 1]
-    thr = int(threshold_otsu(sat))
-    mask = sat >= thr
-    if mask.mean() < 0.05:
-        mask = sat >= max(8, int(np.quantile(sat, 0.5)))
+    gray = np.array(Image.fromarray(region_rgb).convert("L"), dtype=np.uint8)
+    try:
+        thr_gray = int(threshold_otsu(gray))
+    except Exception:
+        thr_gray = int(np.quantile(gray, 0.5))
+    mask_val = (gray >= thr_gray).astype(np.float32)
+
+    h, w = gray.shape
+    yy, xx = np.ogrid[:h, :w]
+    cy, cx = h / 2.0, w / 2.0
+    radius = max(1.0, min(h, w) / 3.0)
+    center_weight = ((xx - cx) ** 2 + (yy - cy) ** 2 <= radius**2).astype(np.float32)
+
+    g = gray.astype(np.float32) / 255.0
+    gx = np.zeros_like(g, dtype=np.float32)
+    gy = np.zeros_like(g, dtype=np.float32)
+    gx[:, 1:-1] = g[:, 2:] - g[:, :-2]
+    gy[1:-1, :] = g[2:, :] - g[:-2, :]
+    edges = np.sqrt(gx**2 + gy**2)
+    edge_mask = (edges > float(np.quantile(edges, 0.75))).astype(np.float32)
+
+    combined = 0.50 * mask_val + 0.30 * center_weight + 0.20 * edge_mask
+    mask = combined > 0.40
+    if mask.mean() < 0.03:
+        mask = center_weight > 0.5
     return mask
 
 
@@ -296,12 +421,23 @@ def _agsfp_2760(image_rgb: np.ndarray, artifacts: AlgorithmicArtifacts) -> tuple
 
 def _ppd_152(image_rgb: np.ndarray) -> np.ndarray:
     gray = np.array(Image.fromarray(image_rgb).convert("L"), dtype=np.float32) / 255.0
-    gx = np.zeros_like(gray, dtype=np.float32)
-    gy = np.zeros_like(gray, dtype=np.float32)
-    gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
-    gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
-    mag = np.sqrt(gx**2 + gy**2)
-    ori = (np.degrees(np.arctan2(gy, gx)) + 180.0) % 180.0
+    if _CP is None:
+        gx = np.zeros_like(gray, dtype=np.float32)
+        gy = np.zeros_like(gray, dtype=np.float32)
+        gx[:, 1:-1] = gray[:, 2:] - gray[:, :-2]
+        gy[1:-1, :] = gray[2:, :] - gray[:-2, :]
+        mag = np.sqrt(gx**2 + gy**2)
+        ori = (np.degrees(np.arctan2(gy, gx)) + 180.0) % 180.0
+    else:
+        gray_gpu = _CP.asarray(gray, dtype=_CP.float32)
+        gx = _CP.zeros_like(gray_gpu, dtype=_CP.float32)
+        gy = _CP.zeros_like(gray_gpu, dtype=_CP.float32)
+        gx[:, 1:-1] = gray_gpu[:, 2:] - gray_gpu[:, :-2]
+        gy[1:-1, :] = gray_gpu[2:, :] - gray_gpu[:-2, :]
+        mag = _CP.sqrt(gx**2 + gy**2)
+        ori = (_CP.degrees(_CP.arctan2(gy, gx)) + 180.0) % 180.0
+        mag = _CP.asnumpy(mag)
+        ori = _CP.asnumpy(ori)
     
     fdi = []
     hs = np.array_split(np.arange(224), 6)
@@ -396,11 +532,17 @@ def _dense_root_patch_descriptor_128(gray: np.ndarray, patch_size: int = 32, str
     return np.stack(descs, axis=0)
 
 
-def _fisher_encode(descriptors: np.ndarray, gmm: GaussianMixture) -> np.ndarray:
+def _fisher_encode(descriptors: np.ndarray, gmm: Any) -> np.ndarray:
     descriptors = descriptors.astype(np.float32)
-    q = gmm.predict_proba(descriptors)  # N x K
-    means = gmm.means_.astype(np.float32)  # K x D
-    cov = gmm.covariances_.astype(np.float32)  # K x D
+    if _CUML is not None and _CP is not None:
+        try:
+            q = _to_cpu_array(gmm.predict_proba(_CP.asarray(descriptors))).astype(np.float32, copy=False)
+        except Exception:
+            q = _to_cpu_array(gmm.predict_proba(descriptors)).astype(np.float32, copy=False)
+    else:
+        q = _to_cpu_array(gmm.predict_proba(descriptors)).astype(np.float32, copy=False)
+    means = _to_cpu_array(gmm.means_).astype(np.float32, copy=False)  # K x D
+    cov = _to_cpu_array(gmm.covariances_).astype(np.float32, copy=False)  # K x D
     sigma = np.sqrt(cov + 1e-8)
     n = float(descriptors.shape[0])
     diff = descriptors[:, None, :] - means[None, :, :]
@@ -416,18 +558,68 @@ def fit_algorithmic_tier2(
     images_dir: str,
     cub_root: str,
     features_dir: str,
+    fit_metadata_df: pd.DataFrame | None = None,
+    fit_images_dir: str | None = None,
 ) -> AlgorithmicArtifacts:
+    """Fit Tier-2 algorithmic artifacts and encode retrieval vectors.
+
+    Args:
+        metadata_df: DataFrame of the 511 filtered images used for retrieval.
+        images_dir: Directory containing the 511 processed/filtered images.
+        cub_root: CUB_200_2011 root path (needed for anatomy part_locs).
+        features_dir: Output directory for saved artifacts.
+        fit_metadata_df: Optional larger pool DataFrame (e.g. 7 486 images from
+            the original CUB dataset for the 126 filtered species).  When
+            provided, unsupervised fitting (PCA, GMM, KMeans, anatomy priors)
+            uses this pool instead of the 511 filtered images.
+        fit_images_dir: Directory of images for fit_metadata_df.  Must be set
+            when fit_metadata_df is provided.
+    """
     os.makedirs(features_dir, exist_ok=True)
+    backend_name = "GPU(cuML+CuPy)" if _CUML is not None and _CP is not None else ("GPU(CuPy partial)" if _CP is not None else "CPU(sklearn/numpy)")
+    print(f"  [INFO] Tier2 backend: {backend_name}")
     prof = _tier2_speed_profile()
-    fast_mode = os.environ.get("ALGO_TIER2_FAST_MODE", "1") == "1"
-    img_rows = metadata_df[["img_id", "filename"]].copy()
-    paths = [os.path.join(images_dir, fn) for fn in img_rows["filename"].tolist() if os.path.exists(os.path.join(images_dir, fn))]
-    sampled_limit = 240 if fast_mode else 600
-    sampled_paths = paths[: min(sampled_limit, len(paths))]
+    # Default to FULL fitting mode for best quality.
+    fast_mode = os.environ.get("ALGO_TIER2_FAST_MODE", "0") == "1"
+
+    # ── Decide which image pool to use for fitting ───────────────────────────
+    use_extended_fit = fit_metadata_df is not None and fit_images_dir is not None
+    if use_extended_fit:
+        fit_img_rows = fit_metadata_df[["img_id", "filepath"]].copy()
+        fit_paths = [
+            os.path.join(fit_images_dir, fp)
+            for fp in fit_img_rows["filepath"].tolist()
+            if os.path.exists(os.path.join(fit_images_dir, fp))
+        ]
+        print(f"  [INFO] Fit pool: EXTENDED ({len(fit_paths)} anh goc cua 126 loai)")
+    else:
+        img_rows = metadata_df[["img_id", "filename"]].copy()
+        fit_paths = [
+            os.path.join(images_dir, fn)
+            for fn in img_rows["filename"].tolist()
+            if os.path.exists(os.path.join(images_dir, fn))
+        ]
+        print(f"  [INFO] Fit pool: FILTERED only ({len(fit_paths)} anh sau loc)")
+
+    # For anatomy priors, always use metadata_df (511 filtered) which has bbox
+    # coords aligned to the cropped/resized images already saved to images_dir.
+    # The extended pool uses raw CUB images, whose bboxes differ, so anatomy
+    # fitting still leverages metadata_df for coordinate-based region mapping.
+    anatomy_meta = metadata_df
+
+    env_fit_cap = int(os.environ.get("ALGO_TIER2_FIT_MAX_IMAGES", "0") or "0")
+    if env_fit_cap > 0:
+        sampled_limit = env_fit_cap
+    elif use_extended_fit:
+        sampled_limit = len(fit_paths)
+    else:
+        sampled_limit = 240 if fast_mode else 600
+    sampled_paths = fit_paths[: min(sampled_limit, len(fit_paths))]
     sampled_imgs = [_read_rgb(p) for p in sampled_paths]
     print(f"  [INFO] Tier2 fit mode={'FAST' if fast_mode else 'FULL'} | sampled_images={len(sampled_imgs)}")
 
-    anatomy_regions = _fit_anatomy_regions(metadata_df, cub_root)
+    anatomy_regions = _fit_anatomy_regions(anatomy_meta, cub_root)
+
 
     color_bank = np.stack([_hsv_hist_256(img) for img in sampled_imgs], axis=0) if sampled_imgs else np.zeros((1, 256), dtype=np.float32)
     color_var = color_bank.var(axis=0)
@@ -465,6 +657,15 @@ def fit_algorithmic_tier2(
         final_pca=dummy,
     )
 
+    # ── Encoding paths: always the 511 filtered images ────────────────────────
+    retrieval_img_rows = metadata_df[["img_id", "filename"]].copy()
+    encode_paths = [
+        os.path.join(images_dir, fn)
+        for fn in retrieval_img_rows["filename"].tolist()
+        if os.path.exists(os.path.join(images_dir, fn))
+    ]
+    print(f"  [INFO] Encode pool: {len(encode_paths)} anh (511 anh da loc cho FAISS/SQLite)")
+
     all_px = []
     for img in tqdm(sampled_imgs, desc="    ACV collect foreground", leave=False):
         mask = _fg_mask(img)
@@ -477,16 +678,27 @@ def fit_algorithmic_tier2(
         if len(px) > 500_000:
             idx = np.random.default_rng(42).choice(len(px), size=500_000, replace=False)
             px = px[idx]
-        km = MiniBatchKMeans(n_clusters=256, batch_size=8000, n_init=3 if fast_mode else 5, random_state=42)
-        km.fit(px)
-        vocab = km.cluster_centers_.astype(np.float32)
+        km, _ = _fit_kmeans(
+            px,
+            n_clusters=256,
+            batch_size=8000,
+            n_init=3 if fast_mode else 5,
+            max_iter=100,
+            random_state=42,
+        )
+        vocab = _cluster_centers(km)
     else:
         vocab = np.zeros((256, 3), dtype=np.float32)
     artifacts.acv_vocab = vocab
     acv_tree = KDTree(artifacts.acv_vocab.astype(np.float32))
 
     desc_pool = []
-    gmm_sample_cap = 160 if fast_mode else 300
+    if env_fit_cap > 0:
+        gmm_sample_cap = env_fit_cap
+    elif use_extended_fit:
+        gmm_sample_cap = len(sampled_imgs)
+    else:
+        gmm_sample_cap = 160 if fast_mode else 300
     for img in tqdm(sampled_imgs[: min(gmm_sample_cap, len(sampled_imgs))], desc="    HFVE collect descriptors", leave=False):
         gray = np.array(Image.fromarray(img).convert("L"), dtype=np.float32) / 255.0
         d = _dense_root_patch_descriptor_128(gray, stride=int(prof["hfve_patch_stride"]))
@@ -497,16 +709,14 @@ def fit_algorithmic_tier2(
         desc_pool.append(d)
     desc_train = np.concatenate(desc_pool, axis=0) if desc_pool else np.zeros((100, 128), dtype=np.float32)
     gmm_k = 48 if fast_mode else 64
-    gmm = GaussianMixture(n_components=gmm_k, covariance_type="diag", max_iter=60 if fast_mode else 100, n_init=2, random_state=42)
-    gmm.fit(desc_train)
+    gmm = _fit_gmm(desc_train, n_components=gmm_k, fast_mode=fast_mode)
     artifacts.hfve_gmm = gmm
 
     agsfp_vectors, acv_vectors, hfve_vectors, ppd_vectors = [], [], [], []
-    acv_df = np.zeros((len(paths), 256), dtype=np.float32)
     acv_df_count = np.zeros(256, dtype=np.float32)
     anatomy_bank = []
     img_ids = []
-    for path in tqdm(paths, desc="    Encode Tier2 algorithmic", leave=False):
+    for path in tqdm(encode_paths, desc="    Encode Tier2 algorithmic", leave=False):
         img = _read_rgb(path)
         ag_raw, anatomy_blocks = _agsfp_2760(img, artifacts)
         agsfp_vectors.append(ag_raw)
@@ -535,7 +745,7 @@ def fit_algorithmic_tier2(
         hfve_vectors.append(_fisher_encode(desc, artifacts.hfve_gmm))
         ppd_vectors.append(_ppd_152(img))
 
-    n_img = max(1, len(paths))
+    n_img = max(1, len(encode_paths))
     idf = np.log((n_img + 1.0) / (acv_df_count + 1.0)).astype(np.float32)
     artifacts.acv_idf = idf
     acv_weighted = [(_l2_normalize(v.reshape(5, 256) * idf.reshape(1, 256)).reshape(-1)) for v in acv_vectors]
@@ -545,20 +755,13 @@ def fit_algorithmic_tier2(
     hfve_mat = np.stack(hfve_vectors, axis=0).astype(np.float32) if hfve_vectors else np.zeros((1, 16384), dtype=np.float32)
     ppd_mat = np.stack(ppd_vectors, axis=0).astype(np.float32) if ppd_vectors else np.zeros((1, 152), dtype=np.float32)
 
-    def _fit_pca(mat: np.ndarray, max_dim: int) -> PCA:
-        n_comp = int(min(max_dim, mat.shape[0], mat.shape[1]))
-        n_comp = max(1, n_comp)
-        pca = PCA(n_components=n_comp, random_state=42)
-        pca.fit(mat)
-        return pca
-
     artifacts.agsfp_pca = _fit_pca(agsfp_mat, 512)
     artifacts.acv_pca = _fit_pca(acv_mat, 256)
     artifacts.hfve_pca = _fit_pca(hfve_mat, 512)
 
-    agsfp_512 = artifacts.agsfp_pca.transform(agsfp_mat).astype(np.float32)
-    acv_256 = artifacts.acv_pca.transform(acv_mat).astype(np.float32)
-    hfve_512 = artifacts.hfve_pca.transform(hfve_mat).astype(np.float32)
+    agsfp_512 = _pca_transform(artifacts.agsfp_pca, agsfp_mat)
+    acv_256 = _pca_transform(artifacts.acv_pca, acv_mat)
+    hfve_512 = _pca_transform(artifacts.hfve_pca, hfve_mat)
     fused = np.concatenate([agsfp_512, acv_256, hfve_512, ppd_mat], axis=1)
     artifacts.final_pca = _fit_pca(fused, 512)
 
@@ -578,12 +781,14 @@ def load_algorithmic_artifacts(features_dir: str) -> AlgorithmicArtifacts:
 def extract_algorithmic_embedding(
     image_path: str,
     artifacts: AlgorithmicArtifacts,
+    acv_tree: KDTree | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     prof = _tier2_speed_profile()
     img = _read_rgb(image_path)
     ag_raw, anatomy_blocks = _agsfp_2760(img, artifacts)
-    agsfp_512 = artifacts.agsfp_pca.transform(ag_raw.reshape(1, -1)).astype(np.float32)
-    acv_tree = KDTree(artifacts.acv_vocab.astype(np.float32))
+    agsfp_512 = _pca_transform(artifacts.agsfp_pca, ag_raw.reshape(1, -1))
+    if acv_tree is None:
+        acv_tree = KDTree(artifacts.acv_vocab.astype(np.float32))
 
     acv_parts = []
     for key in ["head", "breast", "back_wing", "tail", "leg"]:
@@ -599,15 +804,16 @@ def extract_algorithmic_embedding(
         acv_parts.append(hist)
     acv_raw = np.concatenate(acv_parts, axis=0).reshape(5, 256) * artifacts.acv_idf.reshape(1, 256)
     acv_raw = _l2_normalize(acv_raw.reshape(-1)).reshape(1, -1).astype(np.float32)
-    acv_256 = artifacts.acv_pca.transform(acv_raw).astype(np.float32)
+    acv_256 = _pca_transform(artifacts.acv_pca, acv_raw)
 
-    gray = np.array(Image.open(image_path).convert("L").resize((224, 224), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+    # Must match encode loop: grayscale from 224xRGB (bilinear), not L(full) then resize.
+    gray = np.array(Image.fromarray(img).convert("L"), dtype=np.float32) / 255.0
     desc = _dense_root_patch_descriptor_128(gray, stride=int(prof["hfve_patch_stride"]))
     hfve_raw = _fisher_encode(desc, artifacts.hfve_gmm).reshape(1, -1)
-    hfve_512 = artifacts.hfve_pca.transform(hfve_raw).astype(np.float32)
+    hfve_512 = _pca_transform(artifacts.hfve_pca, hfve_raw)
 
     ppd_152 = _ppd_152(img).reshape(1, -1).astype(np.float32)
     fused_1432 = np.concatenate([agsfp_512, acv_256, hfve_512, ppd_152], axis=1).astype(np.float32)
-    final = artifacts.final_pca.transform(fused_1432).reshape(-1).astype(np.float32)
+    final = _pca_transform(artifacts.final_pca, fused_1432).reshape(-1).astype(np.float32)
     return _l2_normalize(final), anatomy_blocks.astype(np.float32)
 

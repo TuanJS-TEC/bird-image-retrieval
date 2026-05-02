@@ -1,0 +1,226 @@
+[
+  {
+    "attribute": "cattr_hu2",
+    "fisher_score": 2.0022793376749695,
+    "mutual_information_bits": 1.1461005952069436,
+    "fisher_score_norm": 1.0,
+    "mutual_information_bits_norm": 0.834346662497082,
+    "combined_information_value": 0.925455998123687
+  },
+  {
+    "attribute": "cattr_hu1",
+    "fisher_score": 0.9945158089768545,
+    "mutual_information_bits": 1.2442199014448703,
+    "fisher_score_norm": 0.41705472339445326,
+    "mutual_information_bits_norm": 0.9057762700101654,
+    "combined_information_value": 0.6369794193715237
+  },
+  {
+    "attribute": "cattr_color_yellow_ratio",
+    "fisher_score": 0.695629103799867,
+    "mutual_information_bits": 1.3736503622808607,
+    "fisher_score_norm": 0.2441623850021268,
+    "mutual_information_bits_norm": 1.0,
+    "combined_information_value": 0.5842893117511698
+  },
+  {
+    "attribute": "cattr_color_red_ratio",
+    "fisher_score": 0.7375702155271705,
+    "mutual_information_bits": 1.2109136707245605,
+    "fisher_score_norm": 0.26842340683986105,
+    "mutual_information_bits_norm": 0.8815297574805818,
+    "combined_information_value": 0.5443212646281854
+  },
+  {
+    "attribute": "cattr_lbp_energy",
+    "fisher_score": 0.8001151217092077,
+    "mutual_information_bits": 1.1463465776317878,
+    "fisher_score_norm": 0.30460278483507097,
+    "mutual_information_bits_norm": 0.8345257345751003,
+    "combined_information_value": 0.5430681122180842
+  },
+  {
+    "attribute": "cattr_color_orange_ratio",
+    "fisher_score": 0.6237806240020117,
+    "mutual_information_bits": 1.2432605570299984,
+    "fisher_score_norm": 0.2026013136428998,
+    "mutual_information_bits_norm": 0.9050778794726497,
+    "combined_information_value": 0.5187157682662873
+  },
+  {
+    "attribute": "cattr_centroid_x",
+    "fisher_score": 0.6169974767050682,
+    "mutual_information_bits": 1.2488977087356612,
+    "fisher_score_norm": 0.1986775720461175,
+    "mutual_information_bits_norm": 0.9091816542471146,
+    "combined_information_value": 0.5184044090365663
+  },
+  {
+    "attribute": "cattr_sat_mean",
+    "fisher_score": 0.6177092881885653,
+    "mutual_information_bits": 1.2219418623348135,
+    "fisher_score_norm": 0.19908932255139156,
+    "mutual_information_bits_norm": 0.8895581407672439,
+    "combined_information_value": 0.5098002907485252
+  },
+  {
+    "attribute": "cattr_hu3",
+    "fisher_score": 0.5258017697499607,
+    "mutual_information_bits": 1.200131202788952,
+    "fisher_score_norm": 0.14592501144803624,
+    "mutual_information_bits_norm": 0.8736802579050822,
+    "combined_information_value": 0.47341487235370694
+  },
+  {
+    "attribute": "cattr_centroid_y",
+    "fisher_score": 0.5882726980061656,
+    "mutual_information_bits": 1.1144173947595193,
+    "fisher_score_norm": 0.18206159658439683,
+    "mutual_information_bits_norm": 0.8112816953719568,
+    "combined_information_value": 0.46521064103879883
+  },
+  {
+    "attribute": "cattr_lbp_entropy",
+    "fisher_score": 0.5524897254987459,
+    "mutual_information_bits": 1.1484182997963341,
+    "fisher_score_norm": 0.16136277765308074,
+    "mutual_information_bits_norm": 0.8360339219722966,
+    "combined_information_value": 0.4649647925967279
+  },
+  {
+    "attribute": "cattr_fg_area_ratio",
+    "fisher_score": 0.46385306680388844,
+    "mutual_information_bits": 1.1675446401463345,
+    "fisher_score_norm": 0.11009050985528128,
+    "mutual_information_bits_norm": 0.8499576545866443,
+    "combined_information_value": 0.44303072498439466
+  },
+  {
+    "attribute": "cattr_color_gray_ratio",
+    "fisher_score": 0.4490268943235556,
+    "mutual_information_bits": 1.17273394251542,
+    "fisher_score_norm": 0.10151424471824612,
+    "mutual_information_bits_norm": 0.8537354007377601,
+    "combined_information_value": 0.44001376492702743
+  },
+  {
+    "attribute": "cattr_symmetry_lr",
+    "fisher_score": 0.3715702940689324,
+    "mutual_information_bits": 1.2263736872008195,
+    "fisher_score_norm": 0.056709131242183256,
+    "mutual_information_bits_norm": 0.8927844529262181,
+    "combined_information_value": 0.43294302599999895
+  },
+  {
+    "attribute": "cattr_edge_density",
+    "fisher_score": 0.5645521641132827,
+    "mutual_information_bits": 1.0250281790699145,
+    "fisher_score_norm": 0.16834034869474424,
+    "mutual_information_bits_norm": 0.7462074827890841,
+    "combined_information_value": 0.4283805590371972
+  },
+  {
+    "attribute": "cattr_color_black_ratio",
+    "fisher_score": 0.3856767481040034,
+    "mutual_information_bits": 1.1969812214295916,
+    "fisher_score_norm": 0.06486907205689124,
+    "mutual_information_bits_norm": 0.8713871115223811,
+    "combined_information_value": 0.4278021898163617
+  },
+  {
+    "attribute": "cattr_bbox_ratio",
+    "fisher_score": 0.39686447976816497,
+    "mutual_information_bits": 1.15971041603331,
+    "fisher_score_norm": 0.07134066498899365,
+    "mutual_information_bits_norm": 0.8442544390318387,
+    "combined_information_value": 0.4191518633082739
+  },
+  {
+    "attribute": "cattr_texture_entropy",
+    "fisher_score": 0.4421049406652142,
+    "mutual_information_bits": 1.1131167342045056,
+    "fisher_score_norm": 0.0975102099669336,
+    "mutual_information_bits_norm": 0.8103348310237001,
+    "combined_information_value": 0.4182812894424785
+  },
+  {
+    "attribute": "cattr_color_white_ratio",
+    "fisher_score": 0.41843799715170293,
+    "mutual_information_bits": 1.1306468848189501,
+    "fisher_score_norm": 0.08381996166958272,
+    "mutual_information_bits_norm": 0.8230965578035313,
+    "combined_information_value": 0.41649442992985963
+  },
+  {
+    "attribute": "cattr_upper_lower_mass_ratio",
+    "fisher_score": 0.3700319869663357,
+    "mutual_information_bits": 1.1708658046632436,
+    "fisher_score_norm": 0.055819290685454666,
+    "mutual_information_bits_norm": 0.8523754201317241,
+    "combined_information_value": 0.41426954893627593
+  },
+  {
+    "attribute": "cattr_val_mean",
+    "fisher_score": 0.34390464820889266,
+    "mutual_information_bits": 1.1823615052125138,
+    "fisher_score_norm": 0.04070581586204995,
+    "mutual_information_bits_norm": 0.8607441439823714,
+    "combined_information_value": 0.4097230635161946
+  },
+  {
+    "attribute": "cattr_grad_anisotropy",
+    "fisher_score": 0.4013103872688361,
+    "mutual_information_bits": 1.12389907276496,
+    "fisher_score_norm": 0.07391241987388172,
+    "mutual_information_bits_norm": 0.8181842364157323,
+    "combined_information_value": 0.4088347373177145
+  },
+  {
+    "attribute": "cattr_color_blue_ratio",
+    "fisher_score": 0.49690051854439005,
+    "mutual_information_bits": 0.9887072278303478,
+    "fisher_score_norm": 0.12920695468322874,
+    "mutual_information_bits_norm": 0.7197662920487723,
+    "combined_information_value": 0.3949586564977233
+  },
+  {
+    "attribute": "cattr_color_green_ratio",
+    "fisher_score": 0.4318925729532735,
+    "mutual_information_bits": 1.0448992370084218,
+    "fisher_score_norm": 0.09160282063292428,
+    "mutual_information_bits_norm": 0.7606733603399862,
+    "combined_information_value": 0.39268456350110215
+  },
+  {
+    "attribute": "cattr_color_magenta_ratio",
+    "fisher_score": 0.31707816755439194,
+    "mutual_information_bits": 0.8928172133903248,
+    "fisher_score_norm": 0.025187919311761228,
+    "mutual_information_bits_norm": 0.6499595806227267,
+    "combined_information_value": 0.3063351669016957
+  },
+  {
+    "attribute": "cattr_color_cyan_ratio",
+    "fisher_score": 0.2735346867769334,
+    "mutual_information_bits": 0.8466094250627625,
+    "fisher_score_norm": 0.0,
+    "mutual_information_bits_norm": 0.6163208981774811,
+    "combined_information_value": 0.2773444041798665
+  },
+  {
+    "attribute": "cattr_fg_aspect_ratio",
+    "fisher_score": 0.8132674935063011,
+    "mutual_information_bits": 0.18001708535215943,
+    "fisher_score_norm": 0.31221083255354753,
+    "mutual_information_bits_norm": 0.13105014951057292,
+    "combined_information_value": 0.23068852518420896
+  },
+  {
+    "attribute": "cattr_color_green_present",
+    "fisher_score": 0.5680459125778139,
+    "mutual_information_bits": 0.0,
+    "fisher_score_norm": 0.17036132296802184,
+    "mutual_information_bits_norm": 0.0,
+    "combined_information_value": 0.09369872763241202
+  }
+]
