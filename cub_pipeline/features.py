@@ -1,16 +1,22 @@
 import json
+import multiprocessing as mp
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy.spatial import KDTree
 from sklearn.decomposition import PCA
+from tqdm import tqdm
 
 from .algorithmic_tier2 import extract_algorithmic_embedding, load_algorithmic_artifacts
+from .common import parallel_tier_extraction_workers
 from .config import (
     ENABLE_GREEN_BINARY,
     ENABLE_HU_BOOST,
     ENABLE_TIER_NORMALIZATION,
+    EXTENDED_FIT_STATS_MAX_IMAGES,
     GREEN_RATIO_BINARY_THRESHOLD,
     HU_MOMENT_WEIGHT,
     RETRIEVAL_EXCLUDED_TIER1_ATTRS,
@@ -36,6 +42,95 @@ from .gpu_backend import load_cuml, load_cupy
 
 _CP = load_cupy()
 _CUML = load_cuml()
+
+_FIT_POOL_ARTIFACTS: Any | None = None
+_FIT_POOL_ACV_TREE: Any | None = None
+
+
+def _fit_pool_worker_init(features_dir: str) -> None:
+    global _FIT_POOL_ARTIFACTS, _FIT_POOL_ACV_TREE
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(k, "1")
+    _FIT_POOL_ARTIFACTS = load_algorithmic_artifacts(features_dir)
+    _FIT_POOL_ACV_TREE = KDTree(_FIT_POOL_ARTIFACTS.acv_vocab.astype(np.float32))
+
+
+def _fit_pool_worker_task(payload: tuple[int, str, str]) -> tuple[int, np.ndarray | None]:
+    img_id, filename_or_path, fit_images_dir = payload
+    img_path = os.path.join(fit_images_dir, filename_or_path)
+    if not os.path.exists(img_path):
+        return img_id, None
+    try:
+        vec, _ = extract_algorithmic_embedding(
+            img_path, _FIT_POOL_ARTIFACTS, acv_tree=_FIT_POOL_ACV_TREE
+        )
+        return img_id, vec
+    except Exception:
+        return img_id, None
+
+
+def _encode_fit_pool_tier2(
+    features_dir: str,
+    rows_data: list[tuple[int, str, str]],
+    artifacts: Any,
+) -> tuple[list[int], list[np.ndarray]]:
+    """Encode fit-pool Tier-2 vectors (same outputs as a sequential loop)."""
+    if not rows_data:
+        return [], []
+    default_workers = max(1, min(parallel_tier_extraction_workers(), len(rows_data), (os.cpu_count() or 4)))
+    n_workers = int(os.environ.get("CUB_FIT_TIER2_WORKERS", str(default_workers)))
+    n_workers = max(1, min(n_workers, len(rows_data)))
+
+    if n_workers == 1:
+        tree = KDTree(artifacts.acv_vocab.astype(np.float32))
+        fit_tier2_ids: list[int] = []
+        fit_tier2_rows: list[np.ndarray] = []
+        for img_id, fname, fid in tqdm(rows_data, desc="  Tier2 fit-pool encode"):
+            p = os.path.join(fid, fname)
+            if not os.path.exists(p):
+                continue
+            try:
+                v, _ = extract_algorithmic_embedding(p, artifacts, acv_tree=tree)
+            except Exception:
+                continue
+            fit_tier2_ids.append(img_id)
+            fit_tier2_rows.append(v)
+        return fit_tier2_ids, fit_tier2_rows
+
+    mp_ctx = mp.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=n_workers,
+        mp_context=mp_ctx,
+        initializer=_fit_pool_worker_init,
+        initargs=(features_dir,),
+    ) as executor:
+        futures = [executor.submit(_fit_pool_worker_task, row) for row in rows_data]
+        fit_tier2_ids: list[int] = []
+        fit_tier2_rows: list[np.ndarray] = []
+        for fut in tqdm(as_completed(futures), total=len(rows_data), desc="  Tier2 fit-pool encode"):
+            img_id, vec = fut.result()
+            if vec is not None:
+                fit_tier2_ids.append(img_id)
+                fit_tier2_rows.append(vec)
+    return fit_tier2_ids, fit_tier2_rows
+
+
+def _downsample_fit_metadata_stratified(df: pd.DataFrame, cap: int, seed: int = 42) -> pd.DataFrame:
+    """Giam so dong extended-fit de encode Tang1/Tang3/Tier2-fit nhanh; giu ty le theo class_id."""
+    if cap <= 0 or len(df) <= cap:
+        return df
+    rng = np.random.default_rng(seed)
+    counts = df.groupby("class_id").size()
+    fracs = counts / float(len(df))
+    chunks: list[pd.DataFrame] = []
+    for cid, g in df.groupby("class_id", sort=False):
+        n_i = max(1, int(np.round(cap * float(fracs[cid]))))
+        n_i = min(n_i, len(g))
+        chunks.append(g.sample(n=n_i, replace=False, random_state=int(rng.integers(0, 2**31 - 1))))
+    sub = pd.concat(chunks, axis=0)
+    if len(sub) > cap:
+        sub = sub.sample(n=cap, replace=False, random_state=seed)
+    return sub.sort_values("img_id").reset_index(drop=True)
 
 
 def _zscore_per_column(matrix: np.ndarray) -> np.ndarray:
@@ -433,6 +528,14 @@ def build_recognition_feature_package(
             "  [INFO] Fit statistics pool: EXTENDED "
             f"({len(fit_metadata_for_extract)} anh goc / {fit_metadata_for_extract['class_id'].nunique()} loai)"
         )
+        cap = int(EXTENDED_FIT_STATS_MAX_IMAGES)
+        if cap > 0 and len(fit_metadata_for_extract) > cap:
+            before = len(fit_metadata_for_extract)
+            fit_metadata_for_extract = _downsample_fit_metadata_stratified(fit_metadata_for_extract, cap)
+            print(
+                f"  [INFO] EXTENDED_FIT_STATS_MAX_IMAGES={cap}: giam extended pool {before} -> "
+                f"{len(fit_metadata_for_extract)} anh (mau stratified theo class_id, chi anh huong z-score fusion)."
+            )
     else:
         print(f"  [INFO] Fit statistics pool: FILTERED ({len(metadata_df)} anh)")
 
@@ -556,20 +659,11 @@ def build_recognition_feature_package(
         # That path may trigger re-fit with metadata schema mismatch (bbox_x/y/w/h).
         # We only need transformed vectors using artifacts already fit above.
         artifacts = load_algorithmic_artifacts(features_dir)
-        fit_tier2_rows: list[np.ndarray] = []
-        fit_tier2_ids: list[int] = []
-        for _, rr in fit_metadata_for_extract.iterrows():
-            img_id = int(rr["img_id"])
-            filename_or_path = str(rr["filename"])
-            img_path = os.path.join(fit_images_dir, filename_or_path)
-            if not os.path.exists(img_path):
-                continue
-            try:
-                vec, _ = extract_algorithmic_embedding(img_path, artifacts)
-            except Exception:
-                continue
-            fit_tier2_rows.append(vec)
-            fit_tier2_ids.append(img_id)
+        rows_data = [
+            (int(rr["img_id"]), str(rr["filename"]), fit_images_dir)
+            for _, rr in fit_metadata_for_extract.iterrows()
+        ]
+        fit_tier2_ids, fit_tier2_rows = _encode_fit_pool_tier2(features_dir, rows_data, artifacts)
         if fit_tier2_rows:
             fit_cnn_matrix = np.vstack(fit_tier2_rows).astype(np.float32)
             fit_ids = fit_metadata_for_extract["img_id"].astype(int).tolist()
@@ -654,6 +748,7 @@ def build_recognition_feature_package(
         "retrieval_excluded_tier1_attrs": list(RETRIEVAL_EXCLUDED_TIER1_ATTRS),
         "fit_pool_mode": "extended_original_images_126_species" if use_extended_fit_pool else "filtered_511_only",
         "fit_pool_total_images": int(len(fit_metadata_for_extract)) if fit_metadata_for_extract is not None else int(len(metadata_df)),
+        "extended_fit_stats_max_images": int(EXTENDED_FIT_STATS_MAX_IMAGES),
     }
     with open(os.path.join(reports_dir, "recognition_features_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)

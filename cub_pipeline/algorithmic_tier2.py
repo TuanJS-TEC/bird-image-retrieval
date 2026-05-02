@@ -781,12 +781,14 @@ def load_algorithmic_artifacts(features_dir: str) -> AlgorithmicArtifacts:
 def extract_algorithmic_embedding(
     image_path: str,
     artifacts: AlgorithmicArtifacts,
+    acv_tree: KDTree | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     prof = _tier2_speed_profile()
     img = _read_rgb(image_path)
     ag_raw, anatomy_blocks = _agsfp_2760(img, artifacts)
     agsfp_512 = _pca_transform(artifacts.agsfp_pca, ag_raw.reshape(1, -1))
-    acv_tree = KDTree(artifacts.acv_vocab.astype(np.float32))
+    if acv_tree is None:
+        acv_tree = KDTree(artifacts.acv_vocab.astype(np.float32))
 
     acv_parts = []
     for key in ["head", "breast", "back_wing", "tail", "leg"]:
@@ -804,7 +806,8 @@ def extract_algorithmic_embedding(
     acv_raw = _l2_normalize(acv_raw.reshape(-1)).reshape(1, -1).astype(np.float32)
     acv_256 = _pca_transform(artifacts.acv_pca, acv_raw)
 
-    gray = np.array(Image.open(image_path).convert("L").resize((224, 224), Image.Resampling.BILINEAR), dtype=np.float32) / 255.0
+    # Must match encode loop: grayscale from 224xRGB (bilinear), not L(full) then resize.
+    gray = np.array(Image.fromarray(img).convert("L"), dtype=np.float32) / 255.0
     desc = _dense_root_patch_descriptor_128(gray, stride=int(prof["hfve_patch_stride"]))
     hfve_raw = _fisher_encode(desc, artifacts.hfve_gmm).reshape(1, -1)
     hfve_512 = _pca_transform(artifacts.hfve_pca, hfve_raw)

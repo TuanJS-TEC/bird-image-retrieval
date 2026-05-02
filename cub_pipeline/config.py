@@ -1,5 +1,8 @@
 CUB_ROOT = "./CUB_200_2011/CUB_200_2011"
-OUTPUT_DIR = "./dataset_processed"
+OUTPUT_DIR = "./dataset_process"
+# True: full pipeline tai metadata.csv + images/ san co duoi OUTPUT_DIR, bo qua loc/crop/luu lai.
+# Can ghi de tam thoi: export BIRD_REUSE_FILTERED_DATASET=0 de chay lai buoc loc.
+REUSE_EXISTING_FILTERED_DATASET = False # False: chay lai buoc loc
 TARGET_SIZE = (224, 224)
 MIN_IMAGES = 500
 ALLOW_RELAX_FALLBACK = False
@@ -61,3 +64,6 @@ TIER2_PCA_DIM = 448
 # instead of only the 511 filtered/perching images.
 # The 511 filtered images are still the only ones encoded into FAISS + SQLite.
 USE_FULL_SPECIES_FOR_FIT = True
+# Gioi han so anh goc trong extended pool CHI cho thong ke z-score (Tang1/Tang3 + encode Tier2 fit).
+# 0 = dung toan bo (~7k anh, rat cham). >0: lay mau stratified theo class_id (giu can bang loai).
+EXTENDED_FIT_STATS_MAX_IMAGES = 2800

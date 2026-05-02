@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps, ImageTk
+from scipy.spatial import KDTree
 
 from cub_pipeline.algorithmic_tier2 import extract_algorithmic_embedding, load_algorithmic_artifacts
 from cub_pipeline.gpu_backend import configure_cuda_library_path, faiss_gpu_available
@@ -78,13 +79,14 @@ class QueryEmbedder:
     def __init__(self, features_dir: str) -> None:
         self.features_dir = features_dir
         self.artifacts = load_algorithmic_artifacts(features_dir)
+        self._acv_tree = KDTree(self.artifacts.acv_vocab.astype(np.float32))
 
     def embed_image(self, image_path: str) -> np.ndarray:
-        feat, _ = extract_algorithmic_embedding(image_path, self.artifacts)
+        feat, _ = extract_algorithmic_embedding(image_path, self.artifacts, acv_tree=self._acv_tree)
         return feat
 
     def anatomy_blocks(self, image_path: str) -> np.ndarray:
-        _, blocks = extract_algorithmic_embedding(image_path, self.artifacts)
+        _, blocks = extract_algorithmic_embedding(image_path, self.artifacts, acv_tree=self._acv_tree)
         return blocks
 
 

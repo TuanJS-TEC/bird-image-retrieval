@@ -1,4 +1,6 @@
+import multiprocessing as mp
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any
 
 import numpy as np
@@ -6,6 +8,7 @@ import pandas as pd
 from PIL import Image
 from tqdm import tqdm
 
+from .common import parallel_tier_extraction_workers
 from .gpu_backend import load_cupy
 
 _CP = load_cupy()
@@ -83,19 +86,47 @@ def extract_hog_shape(img: Image.Image, grid_size: int = 4, n_bins: int = 9) -> 
     return feat / (np.linalg.norm(feat) + 1e-8)
 
 
-def extract_handcrafted_features(metadata_df: pd.DataFrame, images_dir: str) -> pd.DataFrame:
-    feature_rows: list[dict[str, Any]] = []
-    for _, row in tqdm(metadata_df.iterrows(), total=len(metadata_df), desc="  Tang 3 - Handcrafted"):
-        filename = str(row["filename"])
-        img_id = int(row["img_id"])
-        img_path = os.path.join(images_dir, filename)
-        try:
-            img = Image.open(img_path).convert("RGB")
-            vector = np.concatenate([extract_hsv_histogram_48(img), extract_lbp_texture_64(img), extract_hog_shape(img)], axis=0)
-            record: dict[str, Any] = {"img_id": img_id, "filename": filename}
-            for idx, value in enumerate(vector):
-                record[f"hc_{idx:03d}"] = float(value)
-            feature_rows.append(record)
-        except Exception as ex:
-            print(f"  [WARN] Bo qua handcrafted {filename}: {ex}")
-    return pd.DataFrame(feature_rows)
+def _tier3_handcrafted_worker(task: tuple[int, str, str]) -> dict[str, Any] | None:
+    img_id, filename, images_dir = task
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ.setdefault(k, "1")
+    img_path = os.path.join(images_dir, filename)
+    try:
+        img = Image.open(img_path).convert("RGB")
+        vector = np.concatenate(
+            [extract_hsv_histogram_48(img), extract_lbp_texture_64(img), extract_hog_shape(img)], axis=0
+        )
+        record: dict[str, Any] = {"img_id": img_id, "filename": filename}
+        for idx, value in enumerate(vector):
+            record[f"hc_{idx:03d}"] = float(value)
+        return record
+    except Exception as ex:
+        print(f"  [WARN] Bo qua handcrafted {filename}: {ex}")
+        return None
+
+
+def extract_handcrafted_features(
+    metadata_df: pd.DataFrame, images_dir: str, max_workers: int | None = None
+) -> pd.DataFrame:
+    tasks = [(int(row["img_id"]), str(row["filename"]), images_dir) for _, row in metadata_df.iterrows()]
+    workers = int(max_workers) if max_workers is not None else parallel_tier_extraction_workers()
+    if workers <= 1 or len(tasks) < 6:
+        feature_rows: list[dict[str, Any]] = []
+        for t in tqdm(tasks, total=len(tasks), desc="  Tang 3 - Handcrafted"):
+            r = _tier3_handcrafted_worker(t)
+            if r is not None:
+                feature_rows.append(r)
+        out = pd.DataFrame(feature_rows)
+        return out.sort_values("img_id").reset_index(drop=True) if not out.empty else out
+
+    n_workers = max(1, min(workers, len(tasks)))
+    mp_ctx = mp.get_context("spawn")
+    feature_rows = []
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp_ctx) as ex:
+        futures = [ex.submit(_tier3_handcrafted_worker, t) for t in tasks]
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="  Tang 3 - Handcrafted"):
+            r = fut.result()
+            if r is not None:
+                feature_rows.append(r)
+    out = pd.DataFrame(feature_rows)
+    return out.sort_values("img_id").reset_index(drop=True) if not out.empty else out

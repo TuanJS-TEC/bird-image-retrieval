@@ -1,5 +1,7 @@
 import os
 
+import pandas as pd
+
 from .config import (
     ALLOW_RELAX_FALLBACK,
     BUILD_METADATA_DB,
@@ -11,6 +13,7 @@ from .config import (
     MIN_IMAGES,
     OUTPUT_DIR,
     REQUIRE_TORCH_FOR_CNN,
+    REUSE_EXISTING_FILTERED_DATASET,
     SQLITE_DB_PATH,
     TARGET_SIZE,
     USE_FULL_SPECIES_FOR_FIT,
@@ -22,6 +25,46 @@ from .metadata import load_all_metadata, load_full_species_for_fit
 from .processing import process_and_save_dataset
 from .retrieval_db import build_metadata_sqlite_and_faiss
 from .reports import generate_dataset_report, print_final_summary, verify_output_sample
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _try_load_existing_filtered_dataset(output_dir: str) -> pd.DataFrame | None:
+    """Neu metadata.csv + images/ hop le, tra ve DataFrame; nguoc lai None de chay loc lai."""
+    meta_path = os.path.join(output_dir, "metadata.csv")
+    images_dir = os.path.join(output_dir, "images")
+    if not os.path.isfile(meta_path) or not os.path.isdir(images_dir):
+        return None
+    try:
+        df = pd.read_csv(meta_path)
+    except Exception:
+        return None
+    if df.empty or "filename" not in df.columns:
+        return None
+    n = len(df)
+    check_idx = list(range(min(30, n)))
+    if n > 30:
+        step = max(1, n // 20)
+        check_idx = sorted(set(check_idx + list(range(0, n, step))[:20]))
+    missing = 0
+    for i in check_idx:
+        fn = str(df.iloc[i]["filename"])
+        if not os.path.isfile(os.path.join(images_dir, fn)):
+            missing += 1
+    if missing > max(2, len(check_idx) // 5):
+        print(
+            f"  [WARN] Reuse bo loc: {missing}/{len(check_idx)} file kiem tra khong ton tai trong images/. "
+            "Se chay lai buoc loc."
+        )
+        return None
+    return df
 
 
 def main() -> None:
@@ -43,25 +86,40 @@ def main() -> None:
         return
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    reuse_filtered = _env_flag("BIRD_REUSE_FILTERED_DATASET", bool(REUSE_EXISTING_FILTERED_DATASET))
+
     data = load_all_metadata(CUB_ROOT)
     master_df = data["master"]
     attr_labels = data["attr_labels"]
     attr_names = data["attr_names"]
     part_locs = data["part_locs"]
 
-    perching_attr_ids = find_perching_attribute_ids(attr_names)
-    master_df = compute_perching_score(master_df, attr_labels, perching_attr_ids, part_locs)
-    visualize_bbox_distribution(master_df, OUTPUT_DIR)
+    metadata_df: pd.DataFrame | None = None
+    if reuse_filtered:
+        loaded = _try_load_existing_filtered_dataset(OUTPUT_DIR)
+        if loaded is not None:
+            print("\n" + "=" * 60)
+            print("BO QUA LOC ANH (dung metadata.csv + images/ tai OUTPUT_DIR)")
+            print("=" * 60)
+            print(f"  [INFO] BIRD_REUSE_FILTERED_DATASET / REUSE_EXISTING_FILTERED_DATASET -> tai {len(loaded)} dong.")
+            metadata_df = loaded
+        else:
+            print("\n  [INFO] Reuse bat nhung khong hop le -> chay day du buoc loc anh.")
 
-    metadata_df = process_and_save_dataset(
-        master_df,
-        CUB_ROOT,
-        OUTPUT_DIR,
-        target_size=TARGET_SIZE,
-        min_images=MIN_IMAGES,
-        part_locs_df=part_locs,
-        allow_relax_fallback=ALLOW_RELAX_FALLBACK,
-    )
+    if metadata_df is None:
+        perching_attr_ids = find_perching_attribute_ids(attr_names)
+        master_df = compute_perching_score(master_df, attr_labels, perching_attr_ids, part_locs)
+        visualize_bbox_distribution(master_df, OUTPUT_DIR)
+
+        metadata_df = process_and_save_dataset(
+            master_df,
+            CUB_ROOT,
+            OUTPUT_DIR,
+            target_size=TARGET_SIZE,
+            min_images=MIN_IMAGES,
+            part_locs_df=part_locs,
+            allow_relax_fallback=ALLOW_RELAX_FALLBACK,
+        )
 
     # ── Feature fitting pool ─────────────────────────────────────────────────
     # Load all original CUB images belonging to the 126 filtered species.
