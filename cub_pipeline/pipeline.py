@@ -4,15 +4,22 @@ import pandas as pd
 
 from .config import (
     ALLOW_RELAX_FALLBACK,
+    ALLOW_RERUN_FILTERING,
     BUILD_METADATA_DB,
     CUB_ATTR_CERTAINTY_THRESHOLD,
     CUB_ROOT,
     EXTRACT_RECOGNITION_FEATURES,
     FAISS_INDEX_PATH,
     FAISS_USE_COSINE,
+    FORCE_REBUILD_TIER1,
+    FORCE_REBUILD_TIER2,
+    FORCE_REBUILD_TIER3,
+    FORCE_REBUILD_FUSION,
     MIN_IMAGES,
     OUTPUT_DIR,
     REQUIRE_TORCH_FOR_CNN,
+    REUSE_EXISTING_DB,
+    REUSE_EXISTING_FEATURES,
     REUSE_EXISTING_FILTERED_DATASET,
     SQLITE_DB_PATH,
     TARGET_SIZE,
@@ -104,7 +111,18 @@ def main() -> None:
             print(f"  [INFO] BIRD_REUSE_FILTERED_DATASET / REUSE_EXISTING_FILTERED_DATASET -> tai {len(loaded)} dong.")
             metadata_df = loaded
         else:
-            print("\n  [INFO] Reuse bat nhung khong hop le -> chay day du buoc loc anh.")
+            allow_rerun = _env_flag("BIRD_ALLOW_RERUN_FILTERING", bool(ALLOW_RERUN_FILTERING))
+            if not allow_rerun:
+                print("\n" + "=" * 60)
+                print("[LOI] Khong tai duoc bo loc san tai OUTPUT_DIR (metadata.csv + images/).")
+                print("=" * 60)
+                print("  Pipeline da dung de KHONG tu dong chay lai buoc loc.")
+                print("  Hay kiem tra duong dan OUTPUT_DIR, file anh con day du, hoac:")
+                print("    - Trong config: ALLOW_RERUN_FILTERING = True")
+                print("    - Hoac env: export BIRD_ALLOW_RERUN_FILTERING=1")
+                print("    - Hoac tat reuse: REUSE_EXISTING_FILTERED_DATASET = False (hoac BIRD_REUSE_FILTERED_DATASET=0)")
+                return
+            print("\n  [INFO] Reuse khong hop le nhung ALLOW_RERUN_FILTERING -> chay day du buoc loc anh.")
 
     if metadata_df is None:
         perching_attr_ids = find_perching_attribute_ids(attr_names)
@@ -134,7 +152,28 @@ def main() -> None:
         fit_images_dir = os.path.join(CUB_ROOT, "images")
 
     if EXTRACT_RECOGNITION_FEATURES:
-        build_recognition_feature_package(
+        # In trang thai checkpoint de nguoi dung biet buoc nao se chay lai.
+        if REUSE_EXISTING_FEATURES:
+            _skips = []
+            _rebuilds = []
+            for name, force in [
+                ("Tier1", FORCE_REBUILD_TIER1),
+                ("Tier2", FORCE_REBUILD_TIER2),
+                ("Tier3", FORCE_REBUILD_TIER3),
+                ("Fusion", FORCE_REBUILD_FUSION),
+            ]:
+                (_rebuilds if force else _skips).append(name)
+            print("\n  [CHECKPOINT] REUSE_EXISTING_FEATURES=True")
+            if _skips:
+                print(f"    -> Co the bo qua (neu file da co): {', '.join(_skips)}")
+            if _rebuilds:
+                print(f"    -> Bat buoc tinh lai (FORCE_REBUILD=True): {', '.join(_rebuilds)}")
+            if REUSE_EXISTING_DB:
+                print("    -> SQLite/FAISS: giu lai neu features khong thay doi.")
+        else:
+            print("\n  [CHECKPOINT] REUSE_EXISTING_FEATURES=False -> tinh lai toan bo features.")
+
+        features_rebuilt = build_recognition_feature_package(
             metadata_df=metadata_df,
             attr_labels_df=attr_labels,
             attr_names_df=attr_names,
@@ -154,6 +193,7 @@ def main() -> None:
                 sqlite_path=SQLITE_DB_PATH,
                 faiss_path=FAISS_INDEX_PATH,
                 use_cosine=FAISS_USE_COSINE,
+                features_rebuilt=features_rebuilt,
             )
             print(f"  [OK] SQLite DB: {summary['sqlite_path']}")
             print(f"  [OK] FAISS index: {summary['faiss_path']}")

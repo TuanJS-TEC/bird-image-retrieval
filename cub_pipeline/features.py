@@ -17,9 +17,14 @@ from .config import (
     ENABLE_HU_BOOST,
     ENABLE_TIER_NORMALIZATION,
     EXTENDED_FIT_STATS_MAX_IMAGES,
+    FORCE_REBUILD_FUSION,
+    FORCE_REBUILD_TIER1,
+    FORCE_REBUILD_TIER2,
+    FORCE_REBUILD_TIER3,
     GREEN_RATIO_BINARY_THRESHOLD,
     HU_MOMENT_WEIGHT,
     RETRIEVAL_EXCLUDED_TIER1_ATTRS,
+    REUSE_EXISTING_FEATURES,
     TIER1_WEIGHT,
     TIER2_PCA_DIM,
     TIER2_WEIGHT,
@@ -45,6 +50,11 @@ _CUML = load_cuml()
 
 _FIT_POOL_ARTIFACTS: Any | None = None
 _FIT_POOL_ACV_TREE: Any | None = None
+
+
+def _checkpoint_valid(*paths: str) -> bool:
+    """Tra ve True neu TAT CA cac path deu ton tai va kich thuoc > 0."""
+    return all(os.path.isfile(p) and os.path.getsize(p) > 0 for p in paths)
 
 
 def _fit_pool_worker_init(features_dir: str) -> None:
@@ -508,7 +518,7 @@ def build_recognition_feature_package(
     cub_root: str | None = None,
     fit_metadata_df: pd.DataFrame | None = None,
     fit_images_dir: str | None = None,
-) -> None:
+) -> bool:
     print("\n" + "=" * 60)
     print("BUOC 6: Xay dung bo thuoc tinh nhan dien (Yeu cau 2)")
     print("=" * 60)
@@ -539,14 +549,25 @@ def build_recognition_feature_package(
     else:
         print(f"  [INFO] Fit statistics pool: FILTERED ({len(metadata_df)} anh)")
 
-    custom_attrs_df = extract_custom_visual_attributes(metadata_df, images_dir)
+    # ── Checkpoint Tier 1 ────────────────────────────────────────────────────
     custom_path = os.path.join(features_dir, "tier1_custom_attributes.csv")
-    custom_attrs_df.to_csv(custom_path, index=False, encoding="utf-8")
-
-    info_df = build_attribute_information_value_table(custom_attrs_df, metadata_df)
     info_csv_path = os.path.join(features_dir, "tier1_attribute_information_value.csv")
-    info_df.to_csv(info_csv_path, index=False, encoding="utf-8")
-
+    _tier1_cached = (
+        REUSE_EXISTING_FEATURES
+        and not FORCE_REBUILD_TIER1
+        and _checkpoint_valid(custom_path, info_csv_path)
+    )
+    if _tier1_cached:
+        print("  [CACHE] Tier 1 custom attributes: load tu file da co (bo qua extract).")
+        custom_attrs_df = pd.read_csv(custom_path)
+        info_df = pd.read_csv(info_csv_path)
+    else:
+        if REUSE_EXISTING_FEATURES and FORCE_REBUILD_TIER1:
+            print("  [REBUILD] Tier 1: FORCE_REBUILD_TIER1=True, tinh lai.")
+        custom_attrs_df = extract_custom_visual_attributes(metadata_df, images_dir)
+        custom_attrs_df.to_csv(custom_path, index=False, encoding="utf-8")
+        info_df = build_attribute_information_value_table(custom_attrs_df, metadata_df)
+        info_df.to_csv(info_csv_path, index=False, encoding="utf-8")
     all_attr_cols = [c for c in custom_attrs_df.columns if c.startswith("cattr_")]
     similarity_cols = [
         c
@@ -603,27 +624,57 @@ def build_recognition_feature_package(
     cub_312_path = os.path.join(features_dir, "tier1_cub312_binary.csv")
     custom_attrs_df[["img_id"] + all_attr_cols].to_csv(cub_312_path, index=False, encoding="utf-8")
 
-    cnn_matrix, cnn_img_ids, cnn_filenames, anatomy_blocks = extract_efficientnetv2_embeddings(
-        metadata_df,
-        images_dir,
-        require_torch_for_cnn,
-        cub_root=cub_root,
-        fit_metadata_df=fit_metadata_df,
-        fit_images_dir=fit_images_dir,
-    )
+    # ── Checkpoint Tier 2 ────────────────────────────────────────────────────
     cnn_path = os.path.join(features_dir, "tier2_algorithmic_embeddings.npy")
-    np.save(cnn_path, cnn_matrix)
     cnn_index_path = os.path.join(features_dir, "tier2_algorithmic_index.csv")
-    pd.DataFrame({"img_id": cnn_img_ids, "filename": cnn_filenames}).to_csv(cnn_index_path, index=False)
-    np.savez_compressed(
-        os.path.join(features_dir, "tier2_algorithmic_anatomy_blocks.npz"),
-        img_ids=np.array(cnn_img_ids, dtype=np.int32),
-        anatomy_blocks=anatomy_blocks.astype(np.float32),
+    anatomy_path = os.path.join(features_dir, "tier2_algorithmic_anatomy_blocks.npz")
+    _tier2_cached = (
+        REUSE_EXISTING_FEATURES
+        and not FORCE_REBUILD_TIER2
+        and _checkpoint_valid(cnn_path, cnn_index_path, anatomy_path)
     )
+    if _tier2_cached:
+        print("  [CACHE] Tier 2 embeddings: load tu file da co (bo qua encode).")
+        cnn_matrix = np.load(cnn_path).astype(np.float32)
+        _cnn_idx = pd.read_csv(cnn_index_path)
+        cnn_img_ids = _cnn_idx["img_id"].tolist()
+        cnn_filenames = _cnn_idx["filename"].tolist()
+        _anatomy_npz = np.load(anatomy_path)
+        anatomy_blocks = _anatomy_npz["anatomy_blocks"]
+    else:
+        if REUSE_EXISTING_FEATURES and FORCE_REBUILD_TIER2:
+            print("  [REBUILD] Tier 2: FORCE_REBUILD_TIER2=True, tinh lai.")
+        cnn_matrix, cnn_img_ids, cnn_filenames, anatomy_blocks = extract_efficientnetv2_embeddings(
+            metadata_df,
+            images_dir,
+            require_torch_for_cnn,
+            cub_root=cub_root,
+            fit_metadata_df=fit_metadata_df,
+            fit_images_dir=fit_images_dir,
+        )
+        np.save(cnn_path, cnn_matrix)
+        pd.DataFrame({"img_id": cnn_img_ids, "filename": cnn_filenames}).to_csv(cnn_index_path, index=False)
+        np.savez_compressed(
+            anatomy_path,
+            img_ids=np.array(cnn_img_ids, dtype=np.int32),
+            anatomy_blocks=anatomy_blocks.astype(np.float32),
+        )
 
-    handcrafted_df = extract_handcrafted_features(metadata_df, images_dir)
+    # ── Checkpoint Tier 3 ────────────────────────────────────────────────────
     handcrafted_path = os.path.join(features_dir, "tier3_handcrafted_features.csv")
-    handcrafted_df.to_csv(handcrafted_path, index=False, encoding="utf-8")
+    _tier3_cached = (
+        REUSE_EXISTING_FEATURES
+        and not FORCE_REBUILD_TIER3
+        and _checkpoint_valid(handcrafted_path)
+    )
+    if _tier3_cached:
+        print("  [CACHE] Tier 3 handcrafted: load tu file da co (bo qua extract).")
+        handcrafted_df = pd.read_csv(handcrafted_path)
+    else:
+        if REUSE_EXISTING_FEATURES and FORCE_REBUILD_TIER3:
+            print("  [REBUILD] Tier 3: FORCE_REBUILD_TIER3=True, tinh lai.")
+        handcrafted_df = extract_handcrafted_features(metadata_df, images_dir)
+        handcrafted_df.to_csv(handcrafted_path, index=False, encoding="utf-8")
 
     hc_feature_cols = [col for col in handcrafted_df.columns if col.startswith("hc_")]
     handcrafted_matrix = (
@@ -636,6 +687,34 @@ def build_recognition_feature_package(
     else:
         cnn_aligned = np.zeros((len(ordered_img_ids), 0), dtype=np.float32)
 
+    # ── Checkpoint Fusion ─────────────────────────────────────────────────────
+    final_path = os.path.join(features_dir, "recognition_features_all.npz")
+    prototypes_path = os.path.join(features_dir, "tier2_class_prototypes.npz")
+    manifest_path = os.path.join(reports_dir, "recognition_features_manifest.json")
+    _fusion_cached = (
+        REUSE_EXISTING_FEATURES
+        and not FORCE_REBUILD_FUSION
+        and not any([
+            # Neu bat ky tier nao vua duoc tinh lai (khong dung cache), fusion phai chay lai.
+            not _tier1_cached,
+            not _tier2_cached,
+            not _tier3_cached,
+        ])
+        and _checkpoint_valid(final_path, prototypes_path, manifest_path)
+    )
+    if _fusion_cached:
+        print("  [CACHE] Fusion (recognition_features_all.npz): load tu file da co (bo qua fusion).")
+        write_attribute_diagnostic_reports(
+            reports_dir=reports_dir,
+            custom_attrs_df=custom_attrs_df,
+            info_df=info_df,
+            metadata_df=metadata_df,
+            cnn_aligned=cnn_aligned,
+        )
+        return False
+
+    if REUSE_EXISTING_FEATURES and FORCE_REBUILD_FUSION:
+        print("  [REBUILD] Fusion: FORCE_REBUILD_FUSION=True, tinh lai.")
     fit_retrieval_custom_matrix = None
     fit_handcrafted_matrix = None
     fit_tier2_matrix = None
@@ -701,7 +780,6 @@ def build_recognition_feature_package(
     tier2_weighted = tier2_for_fusion * float(TIER2_WEIGHT)
     tier3_weighted = tier3_for_fusion * float(TIER3_WEIGHT)
     final_matrix = np.concatenate([custom_weighted, tier2_weighted, tier3_weighted], axis=1)
-    final_path = os.path.join(features_dir, "recognition_features_all.npz")
     np.savez_compressed(
         final_path,
         img_ids=np.array(ordered_img_ids, dtype=np.int32),
@@ -753,3 +831,4 @@ def build_recognition_feature_package(
     with open(os.path.join(reports_dir, "recognition_features_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
     write_requirement2_report(reports_dir, similarity_cols, difference_cols, info_df, manifest)
+    return True

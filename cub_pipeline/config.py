@@ -1,8 +1,15 @@
 CUB_ROOT = "./CUB_200_2011/CUB_200_2011"
 OUTPUT_DIR = "./dataset_process"
-# True: full pipeline tai metadata.csv + images/ san co duoi OUTPUT_DIR, bo qua loc/crop/luu lai.
-# Can ghi de tam thoi: export BIRD_REUSE_FILTERED_DATASET=0 de chay lai buoc loc.
-REUSE_EXISTING_FILTERED_DATASET = False # False: chay lai buoc loc
+# True (khuyen nghi sau khi da co anh loc): dung metadata.csv + images/ trong OUTPUT_DIR,
+# KHONG chay lai find_perching / compute_perching_score / process_and_save_dataset.
+# De chay lai buoc loc tu dau: dat False hoac export BIRD_REUSE_FILTERED_DATASET=0
+REUSE_EXISTING_FILTERED_DATASET = True
+
+# Chi anh huong khi REUSE_EXISTING_FILTERED_DATASET=True nhung metadata.csv + images/ khong hop le:
+#   False (mac dinh): dung pipeline, in huong dan — khong tu dong ghi de bo loc (tranh chay lai loc vo tinh).
+#   True: fallback nhu cu — chay day du buoc loc.
+# Env: BIRD_ALLOW_RERUN_FILTERING=1
+ALLOW_RERUN_FILTERING = False
 TARGET_SIZE = (224, 224)
 MIN_IMAGES = 500
 ALLOW_RELAX_FALLBACK = False
@@ -11,7 +18,26 @@ EXTRACT_RECOGNITION_FEATURES = True
 CUB_ATTR_CERTAINTY_THRESHOLD = 3
 REQUIRE_TORCH_FOR_CNN = True
 
+# ── Checkpoint / cache cho features (Nhom 1) ─────────────────────────────────
+# True (mac dinh): neu file output cua buoc do da ton tai thi load va bo qua,
+# khong tinh lai tu dau. Dat False de ep tinh lai toan bo (huu ich khi thay doi
+# tham so anh huong dac trung, vi du TARGET_SIZE, certainty_threshold, v.v.)
+REUSE_EXISTING_FEATURES = True
+
+# Kiem soat tung buoc rieng le (chi co hieu luc khi REUSE_EXISTING_FEATURES=True):
+#   FORCE_REBUILD_TIER1 = True  -> luon tinh lai Tier 1 du file da co.
+#   FORCE_REBUILD_TIER2 = True  -> luon tinh lai Tier 2 embedding (giu nguyen fit .pkl).
+#   FORCE_REBUILD_TIER3 = True  -> luon tinh lai Tier 3 handcrafted.
+#   FORCE_REBUILD_FUSION = True -> luon tinh lai fusion / recognition_features_all.npz.
+FORCE_REBUILD_TIER1 = False
+FORCE_REBUILD_TIER2 = False
+FORCE_REBUILD_TIER3 = False
+FORCE_REBUILD_FUSION = False
+
 BUILD_METADATA_DB = True
+# True (mac dinh): chi build lai SQLite + FAISS khi chua co, hoac khi features
+# moi duoc tinh lai trong lan chay nay. False: luon build lai.
+REUSE_EXISTING_DB = True
 SQLITE_DB_PATH = "birds.db"
 FAISS_INDEX_PATH = "birds.faiss"
 FAISS_USE_COSINE = True
