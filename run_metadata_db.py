@@ -22,11 +22,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     use_cosine = args.metric == "cosine"
+    # Luon build lai DB khi chay script doc lap (khong dung nhanh cache SQLite/FAISS).
     summary = build_metadata_sqlite_and_faiss(
         output_dir=args.output_dir,
         sqlite_path=args.sqlite_path,
         faiss_path=args.faiss_path,
         use_cosine=use_cosine,
+        features_rebuilt=True,
     )
     print("[OK] Tao CSDL thanh cong:")
     print(json.dumps(summary, indent=2, ensure_ascii=False))

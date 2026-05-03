@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .config import REUSE_EXISTING_DB
 from .gpu_backend import faiss_gpu_available
 
 
@@ -43,8 +44,35 @@ def build_metadata_sqlite_and_faiss(
     sqlite_path: str = "birds.db",
     faiss_path: str = "birds.faiss",
     use_cosine: bool = True,
+    features_rebuilt: bool = False,
 ) -> dict[str, Any]:
     faiss = _load_faiss()
+    print(f"  [INFO] FAISS: {faiss}")
+    # ── Checkpoint SQLite + FAISS ─────────────────────────────────────────────
+    # Bo qua build lai neu: REUSE_EXISTING_DB=True, ca hai file da co, va features
+    # khong vua duoc tinh lai trong lan chay nay (features_rebuilt=False).
+    if (
+        REUSE_EXISTING_DB
+        and not features_rebuilt
+        and os.path.isfile(sqlite_path) and os.path.getsize(sqlite_path) > 0
+        and os.path.isfile(faiss_path) and os.path.getsize(faiss_path) > 0
+    ):
+        print("  [CACHE] SQLite + FAISS: dung file da co (bo qua build lai).")
+        import faiss as _faiss_mod  # noqa: F811
+        _idx = _faiss_mod.read_index(faiss_path)
+        conn = sqlite3.connect(sqlite_path)
+        inserted = conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        conn.close()
+        metric = "cosine(IndexFlatIP + normalize_L2)" if use_cosine else "L2(IndexFlatL2)"
+        return {
+            "total_vectors": int(_idx.ntotal),
+            "dimension": int(_idx.d),
+            "inserted_rows": int(inserted),
+            "sqlite_path": sqlite_path,
+            "faiss_path": faiss_path,
+            "metric": metric,
+        }
+
     metadata_path = os.path.join(output_dir, "metadata.csv")
     cub_attr_path = os.path.join(output_dir, "features", "tier1_cub312_binary.csv")
     emb_path = os.path.join(output_dir, "features", "tier2_algorithmic_embeddings.npy")

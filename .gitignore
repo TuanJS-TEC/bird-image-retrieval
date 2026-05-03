@@ -20,6 +20,8 @@ ENV/
 # Dataset folders (large)
 CUB_200_2011/
 dataset_processed/
+dataset_process/
+data/
 
 # IDE/Editor
 .cursor/
